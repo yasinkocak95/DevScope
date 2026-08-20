@@ -2,6 +2,16 @@ import type { Header, PageEvent, PageInfo, ReplayRequest, ReplayResponse } from 
 
 const SOURCE = 'devscope-page-hook';
 const MAX_BODY_CHARS = 100_000;
+const INSTALL_FLAG = '__devscopePageHookInstalled__';
+type DevScopeWindow = Window & { [INSTALL_FLAG]?: boolean; navigation?: EventTarget };
+
+const devScopeWindow = window as DevScopeWindow;
+if (!devScopeWindow[INSTALL_FLAG]) {
+  devScopeWindow[INSTALL_FLAG] = true;
+  installPageHook();
+}
+
+function installPageHook(): void {
 
 const send = (payload: PageEvent): void => {
   window.postMessage({ source: SOURCE, payload }, window.location.origin);
@@ -56,6 +66,73 @@ const pageInfo = (): PageInfo => ({
 const sendPageInfo = (): void => send({ kind: 'page-info', pageInfo: pageInfo() });
 window.addEventListener('DOMContentLoaded', sendPageInfo, { once: true });
 window.addEventListener('resize', sendPageInfo);
+window.addEventListener('pageshow', sendPageInfo);
+
+let lastPageUrl = location.href;
+const sendPageInfoOnNavigation = (): void => {
+  if (location.href === lastPageUrl) return;
+  lastPageUrl = location.href;
+  sendPageInfo();
+};
+const checkNavigationAfterCurrentTask = (): void => {
+  queueMicrotask(sendPageInfoOnNavigation);
+  window.setTimeout(sendPageInfoOnNavigation, 0);
+};
+const nativePushState = history.pushState;
+const nativeReplaceState = history.replaceState;
+history.pushState = function devScopePushState(data: unknown, unused: string, url?: string | URL | null): void {
+  nativePushState.call(this, data, unused, url);
+  checkNavigationAfterCurrentTask();
+};
+history.replaceState = function devScopeReplaceState(data: unknown, unused: string, url?: string | URL | null): void {
+  nativeReplaceState.call(this, data, unused, url);
+  checkNavigationAfterCurrentTask();
+};
+window.addEventListener('popstate', sendPageInfoOnNavigation);
+window.addEventListener('hashchange', sendPageInfoOnNavigation);
+devScopeWindow.navigation?.addEventListener('navigate', checkNavigationAfterCurrentTask);
+devScopeWindow.navigation?.addEventListener('currententrychange', checkNavigationAfterCurrentTask);
+
+// Some routers replace the History API methods after document_start or update the
+// address bar through another navigation primitive. This lightweight fallback
+// keeps route detection alive without installing more listeners or wrappers.
+window.setInterval(sendPageInfoOnNavigation, 500);
+
+const meaningfulControl = (event: Event): Element | undefined => {
+  const path = event.composedPath();
+  if (path.some((item) => item instanceof Element && item.id.startsWith('devscope-floating-'))) return undefined;
+  return path.find((item): item is Element => item instanceof Element && item.matches('button, a, [role="button"], [role="link"], input[type="button"], input[type="submit"]'));
+};
+
+const controlLabel = (element?: Element | null): string | undefined => {
+  if (!element) return undefined;
+  if (element instanceof HTMLInputElement && element.type.toLowerCase() === 'password') return undefined;
+  const raw = element.getAttribute('aria-label')
+    ?? element.getAttribute('title')
+    ?? (element instanceof HTMLInputElement && ['button', 'submit'].includes(element.type.toLowerCase()) ? element.value : undefined)
+    ?? element.textContent;
+  const value = raw?.replace(/\s+/g, ' ').trim().slice(0, 160);
+  return value || undefined;
+};
+
+document.addEventListener('click', (event) => {
+  const control = meaningfulControl(event);
+  if (!control) return;
+  send({ kind: 'debug-action', action: 'click', timestamp: Date.now(), label: controlLabel(control) });
+}, true);
+
+document.addEventListener('submit', (event) => {
+  const path = event.composedPath();
+  if (path.some((item) => item instanceof Element && item.id.startsWith('devscope-floating-'))) return;
+  const submitter = event instanceof SubmitEvent ? event.submitter : undefined;
+  const form = path.find((item): item is HTMLFormElement => item instanceof HTMLFormElement);
+  const label = controlLabel(submitter)
+    ?? form?.getAttribute('aria-label')?.replace(/\s+/g, ' ').trim().slice(0, 160)
+    ?? form?.getAttribute('name')?.slice(0, 160)
+    ?? form?.id.slice(0, 160)
+    ?? undefined;
+  send({ kind: 'debug-action', action: 'submit', timestamp: Date.now(), label });
+}, true);
 
 const nativeFetch = window.fetch;
 window.fetch = async function devScopeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -139,19 +216,48 @@ NativeXHR.prototype.send = function (this: TrackedXhr, body?: Document | XMLHttp
 };
 
 const serializeConsole = (args: unknown[]): string => args.map(safeString).join(' ').slice(0, 10_000);
+
+const NON_ACTIONABLE_CONSOLE_PATTERNS = [
+  /\[GPT\].*\bdeprecated\b/i,
+  /googletag\.(?:encryptedSignalProviders|secureSignalProviders)/i,
+  /Google Deploy of the SharedId library has been deprecated/i,
+  /@formatjs\/intl Error MISSING_TRANSLATION.*artifacts\.folder_surface\.root_breadcrumb\.tooltip\.view_in_library/i
+];
+
+const isNonActionableConsoleNoise = (message: string): boolean =>
+  NON_ACTIONABLE_CONSOLE_PATTERNS.some((pattern) => pattern.test(message));
+
+const consoleCaller = (): { source?: string; line?: number } => {
+  const lines = new Error().stack?.split('\n').slice(2) ?? [];
+  for (const stackLine of lines) {
+    const match = stackLine.match(/((?:https?|file|chrome-extension):\/\/[^\s)]+?):(\d+):(\d+)/i);
+    if (!match || /\/assets\/pageHook\.js(?::|$)/i.test(match[1])) continue;
+    return { source: match[1], line: Number(match[2]) };
+  }
+  return {};
+};
+
 (['error', 'warn'] as const).forEach((level) => {
   const native = console[level];
   console[level] = (...args: unknown[]): void => {
-    send({ kind: 'console', level, message: serializeConsole(args), timestamp: Date.now() });
+    const message = serializeConsole(args);
+    if (!isNonActionableConsoleNoise(message)) {
+      send({ kind: 'console', level, message, timestamp: Date.now(), ...consoleCaller() });
+    }
     native.apply(console, args);
   };
 });
 
 window.addEventListener('error', (event) => {
-  send({ kind: 'console', level: 'error', message: event.message, timestamp: Date.now(), source: event.filename, line: event.lineno });
+  if (!isNonActionableConsoleNoise(event.message)) {
+    send({ kind: 'console', level: 'error', message: event.message, timestamp: Date.now(), source: event.filename, line: event.lineno });
+  }
 });
 window.addEventListener('unhandledrejection', (event) => {
-  send({ kind: 'console', level: 'error', message: `Unhandled promise rejection: ${safeString(event.reason)}`, timestamp: Date.now() });
+  const message = `Unhandled promise rejection: ${safeString(event.reason)}`;
+  if (!isNonActionableConsoleNoise(message)) {
+    send({ kind: 'console', level: 'error', message, timestamp: Date.now() });
+  }
 });
 
 window.addEventListener('message', (event: MessageEvent<unknown>) => {
@@ -193,3 +299,4 @@ window.addEventListener('message', (event: MessageEvent<unknown>) => {
     error: error instanceof Error ? error.message : String(error)
   }));
 });
+}

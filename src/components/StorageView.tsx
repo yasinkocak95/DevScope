@@ -4,6 +4,7 @@ import type { ExtensionMessage, Header, JwtRecord, StorageSnapshot } from '../ty
 import type { Language, Translate } from '../utils/i18n';
 import { inspectJwtStorage } from '../utils/jwt';
 import { redactHeaders, redactText } from '../utils/redaction';
+import { sendRuntimeMessage } from '../utils/chromeRuntime';
 
 type StorageTab = 'local' | 'session' | 'cookies' | 'jwt';
 
@@ -39,7 +40,7 @@ export function StorageView({ tabId, reveal, t, language }: { tabId?: number; re
     if (tabId === undefined) return;
     setLoading(true); setError('');
     try {
-      const result = await chrome.runtime.sendMessage({ type: 'GET_STORAGE_DATA', tabId } satisfies ExtensionMessage) as Partial<StorageSnapshot> & { error?: string };
+      const result = await sendRuntimeMessage<Partial<StorageSnapshot> & { error?: string }>({ type: 'GET_STORAGE_DATA', tabId } satisfies ExtensionMessage);
       setSnapshot({ local: result.local ?? [], session: result.session ?? [], cookies: result.cookies ?? [] });
       if (result.error) setError(result.error === 'UNSUPPORTED_TAB' ? t('unsupportedStoragePage') : `${t('storageLoadError')} ${result.error}`);
     } catch (reason) {

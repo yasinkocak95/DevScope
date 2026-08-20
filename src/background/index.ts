@@ -1,11 +1,16 @@
 import { DEFAULT_SETTINGS, getSettings } from '../services/settings';
-import type { CookieRecord, ExtensionMessage, Header, NetworkRecord, PageNetworkEvent, RequestRule, Settings, StorageSnapshot, TabSnapshot, WebStorageData } from '../types';
+import type { CookieRecord, DebugSession, DebugTraceEvent, ExtensionMessage, Header, NetworkRecord, PageNetworkEvent, RequestRule, Settings, StorageSnapshot, TabSnapshot, WebStorageData } from '../types';
+import { redactText, redactUrl } from '../utils/redaction';
 
-const emptySnapshot = (): TabSnapshot => ({ requests: [], console: [], paused: false });
+const emptyDebugSession = (): DebugSession => ({ recording: false, events: [] });
+const emptySnapshot = (): TabSnapshot => ({ requests: [], console: [], paused: false, debugSession: emptyDebugSession() });
 const keyFor = (tabId: number): string => `devscope:tab:${tabId}`;
+const floatingKeyFor = (tabId: number): string => `devscope:floating:${tabId}`;
 const queues = new Map<number, Promise<unknown>>();
 const pending = new Map<string, NetworkRecord>();
 const RULES_KEY = 'devscope:rules';
+const MAX_DEBUG_EVENTS = 500;
+const ACTION_ASSOCIATION_WINDOW_MS = 5_000;
 let settings: Settings = DEFAULT_SETTINGS;
 
 getSettings().then((value) => { settings = value; }).catch(() => undefined);
@@ -18,7 +23,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
 async function loadSnapshot(tabId: number): Promise<TabSnapshot> {
   const key = keyFor(tabId);
   const result = await chrome.storage.session.get(key);
-  return (result[key] as TabSnapshot | undefined) ?? emptySnapshot();
+  const stored = result[key] as Partial<TabSnapshot> | undefined;
+  if (!stored) return emptySnapshot();
+  return {
+    ...emptySnapshot(),
+    ...stored,
+    debugSession: { ...emptyDebugSession(), ...stored.debugSession, events: stored.debugSession?.events ?? [] }
+  };
 }
 
 async function saveSnapshot(tabId: number, snapshot: TabSnapshot): Promise<void> {
@@ -35,6 +46,19 @@ function updateSnapshot(tabId: number, mutate: (snapshot: TabSnapshot) => void):
   }).catch(() => undefined);
   queues.set(tabId, next);
   return next.then(() => undefined);
+}
+
+function appendDebugEvent(session: DebugSession, event: DebugTraceEvent): void {
+  session.events.push(event);
+  if (session.events.length > MAX_DEBUG_EVENTS) session.events = session.events.slice(-MAX_DEBUG_EVENTS);
+}
+
+function relatedAction(session: DebugSession, timestamp: number): DebugTraceEvent | undefined {
+  return [...session.events].reverse().find((event) =>
+    (event.kind === 'click' || event.kind === 'submit')
+    && timestamp >= event.timestamp
+    && timestamp - event.timestamp <= ACTION_ASSOCIATION_WINDOW_MS
+  );
 }
 
 async function getRules(): Promise<RequestRule[]> {
@@ -88,6 +112,19 @@ async function syncRules(): Promise<void> {
 chrome.runtime.onInstalled.addListener(() => { void syncRules(); });
 chrome.runtime.onStartup.addListener(() => { void syncRules(); });
 
+chrome.action.onClicked.addListener((tab) => {
+  if (tab.id === undefined) return;
+  const tabId = tab.id;
+  void chrome.storage.session.set({ [floatingKeyFor(tabId)]: true }).then(async () => {
+    let mounted = false;
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: 'SHOW_FLOATING_PANEL', tabId } satisfies ExtensionMessage) as { mounted?: boolean } | undefined;
+      mounted = response?.mounted === true;
+    } catch { /* The fallback below covers tabs without a current content script. */ }
+    if (!mounted) await chrome.scripting.executeScript({ target: { tabId }, files: ['assets/floatingLoader.js'] });
+  }).catch(() => undefined);
+});
+
 async function loadStorageData(tabId: number): Promise<StorageSnapshot> {
   const tab = await chrome.tabs.get(tabId);
   if (!tab.url || !/^https?:/i.test(tab.url)) throw new Error('UNSUPPORTED_TAB');
@@ -121,7 +158,7 @@ const requestBody = (details: chrome.webRequest.OnBeforeRequestDetails): string 
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details): undefined => {
-    if (!settings.captureNetworkRequests || details.tabId < 0 || details.type !== 'xmlhttprequest') return undefined;
+    if (details.tabId < 0 || details.type !== 'xmlhttprequest') return undefined;
     pending.set(details.requestId, {
       id: details.requestId,
       tabId: details.tabId,
@@ -133,7 +170,20 @@ chrome.webRequest.onBeforeRequest.addListener(
       resourceType: 'xmlhttprequest',
       requestHeaders: [],
       responseHeaders: [],
-      requestBody: requestBody(details)
+      requestBody: settings.captureNetworkRequests ? requestBody(details) : undefined
+    });
+    void updateSnapshot(details.tabId, (snapshot) => {
+      const session = snapshot.debugSession;
+      if (!session.recording) return;
+      const action = relatedAction(session, details.timeStamp);
+      appendDebugEvent(session, {
+        id: `network:${details.requestId}:request`,
+        kind: 'request',
+        timestamp: details.timeStamp,
+        method: details.method,
+        url: redactUrl(details.url),
+        relatedActionId: action?.id
+      });
     });
     return undefined;
   },
@@ -175,27 +225,46 @@ async function finishRequest(requestId: string, endTime: number, error?: string)
   item.error = error;
   if (item.requestBody) item.requestSize = new TextEncoder().encode(item.requestBody).byteLength;
   await updateSnapshot(item.tabId, (snapshot) => {
-    if (snapshot.paused) return;
-    const pageRecord = snapshot.requests.find((candidate) =>
-      candidate.method === item.method && candidate.url === item.url && Math.abs(candidate.startedAt - item.startedAt) < 5_000
-    );
-    if (pageRecord) {
-      Object.assign(pageRecord, {
-        status: item.status || pageRecord.status,
-        statusText: item.statusText || pageRecord.statusText,
-        duration: item.duration || pageRecord.duration,
-        requestHeaders: item.requestHeaders.length ? item.requestHeaders : pageRecord.requestHeaders,
-        responseHeaders: item.responseHeaders.length ? item.responseHeaders : pageRecord.responseHeaders,
-        requestBody: pageRecord.requestBody ?? item.requestBody,
-        requestSize: item.requestSize ?? pageRecord.requestSize,
-        responseSize: item.responseSize ?? pageRecord.responseSize,
-        contentType: pageRecord.contentType ?? item.contentType,
-        error: item.error ?? pageRecord.error
-      });
-    } else {
-      snapshot.requests.unshift(item);
+    if (settings.captureNetworkRequests && !snapshot.paused) {
+      const pageRecord = snapshot.requests.find((candidate) =>
+        candidate.method === item.method && candidate.url === item.url && Math.abs(candidate.startedAt - item.startedAt) < 5_000
+      );
+      if (pageRecord) {
+        Object.assign(pageRecord, {
+          status: item.status || pageRecord.status,
+          statusText: item.statusText || pageRecord.statusText,
+          duration: item.duration || pageRecord.duration,
+          requestHeaders: item.requestHeaders.length ? item.requestHeaders : pageRecord.requestHeaders,
+          responseHeaders: item.responseHeaders.length ? item.responseHeaders : pageRecord.responseHeaders,
+          requestBody: pageRecord.requestBody ?? item.requestBody,
+          requestSize: item.requestSize ?? pageRecord.requestSize,
+          responseSize: item.responseSize ?? pageRecord.responseSize,
+          contentType: pageRecord.contentType ?? item.contentType,
+          error: item.error ?? pageRecord.error
+        });
+      } else {
+        snapshot.requests.unshift(item);
+      }
+      snapshot.requests = snapshot.requests.slice(0, settings.maximumStoredRequests);
     }
-    snapshot.requests = snapshot.requests.slice(0, settings.maximumStoredRequests);
+
+    const session = snapshot.debugSession;
+    if (!session.recording) return;
+    const requestEventId = `network:${requestId}:request`;
+    const requestEvent = session.events.find((event) => event.id === requestEventId);
+    const failed = Boolean(item.error) || item.status === 0 || item.status >= 400;
+    appendDebugEvent(session, {
+      id: `network:${requestId}:response`,
+      kind: failed ? 'failed-request' : 'response',
+      timestamp: endTime,
+      method: item.method,
+      url: redactUrl(item.url),
+      status: item.status,
+      statusText: item.statusText ? redactText(item.statusText).slice(0, 300) : undefined,
+      error: item.error ? redactText(item.error).slice(0, 500) : undefined,
+      relatedActionId: requestEvent?.relatedActionId,
+      requestEventId
+    });
   });
 }
 
@@ -258,19 +327,89 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
     if (tabId === undefined) return;
     void updateSnapshot(tabId, (snapshot) => {
       const payload = message.payload;
-      if (snapshot.paused) return;
-      if (payload.kind === 'page-info') snapshot.pageInfo = payload.pageInfo;
-      if (payload.kind === 'network' && settings.captureNetworkRequests) {
+      const session = snapshot.debugSession;
+      if (payload.kind === 'page-info') {
+        snapshot.pageInfo = payload.pageInfo;
+        if (session.recording) {
+          const safeUrl = redactUrl(payload.pageInfo.url);
+          if (session.lastUrl !== safeUrl) {
+            appendDebugEvent(session, {
+              id: crypto.randomUUID(),
+              kind: 'navigation',
+              timestamp: payload.pageInfo.timestamp,
+              url: safeUrl
+            });
+            session.lastUrl = safeUrl;
+          }
+        }
+      }
+      if (payload.kind === 'debug-action' && session.recording) {
+        const actionId = crypto.randomUUID();
+        appendDebugEvent(session, {
+          id: actionId,
+          kind: payload.action,
+          timestamp: payload.timestamp,
+          label: payload.label ? redactText(payload.label).slice(0, 160) : undefined
+        });
+        session.events.forEach((event) => {
+          if (!event.relatedActionId
+            && (event.kind === 'request' || event.kind === 'response' || event.kind === 'failed-request' || event.kind === 'console')
+            && event.timestamp >= payload.timestamp
+            && event.timestamp - payload.timestamp <= ACTION_ASSOCIATION_WINDOW_MS) {
+            event.relatedActionId = actionId;
+          }
+        });
+      }
+      if (payload.kind === 'network' && settings.captureNetworkRequests && !snapshot.paused) {
         mergePageNetwork(snapshot, payload);
         snapshot.requests.forEach((request) => { if (request.tabId < 0) request.tabId = tabId; });
         snapshot.requests = snapshot.requests.slice(0, settings.maximumStoredRequests);
       }
-      if (payload.kind === 'console' && settings.captureConsoleErrors) {
+      if (payload.kind === 'console' && settings.captureConsoleErrors && !snapshot.paused) {
         snapshot.console.unshift({ ...payload, id: crypto.randomUUID(), tabId });
         snapshot.console = snapshot.console.slice(0, 100);
       }
+      if (payload.kind === 'console' && session.recording) {
+        const action = relatedAction(session, payload.timestamp);
+        appendDebugEvent(session, {
+          id: crypto.randomUUID(),
+          kind: 'console',
+          timestamp: payload.timestamp,
+          level: payload.level,
+          label: redactText(payload.message).slice(0, 1_000),
+          relatedActionId: action?.id
+        });
+      }
     });
     return;
+  }
+
+  if (message.type === 'GET_FLOATING_STATE') {
+    const tabId = sender.tab?.id;
+    if (tabId === undefined) {
+      sendResponse({ open: false });
+      return;
+    }
+    chrome.storage.session.get(floatingKeyFor(tabId)).then((result) => {
+      sendResponse({ open: result[floatingKeyFor(tabId)] === true, tabId });
+    }).catch((error: unknown) => sendResponse({ open: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === 'SET_FLOATING_OPEN') {
+    const tabId = sender.tab?.id;
+    if (tabId === undefined) {
+      sendResponse({ ok: false });
+      return;
+    }
+    chrome.storage.session.set({ [floatingKeyFor(tabId)]: message.open })
+      .then(() => sendResponse({ ok: true }))
+      .catch((error: unknown) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === 'GET_TAB_INFO') {
+    chrome.tabs.get(message.tabId).then((tab) => sendResponse({ id: tab.id, url: tab.url ?? '' }))
+      .catch((error: unknown) => sendResponse({ error: error instanceof Error ? error.message : String(error) }));
+    return true;
   }
 
   if (message.type === 'GET_SNAPSHOT') {
@@ -289,12 +428,46 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
       .then(() => sendResponse({ ok: true })).catch((error: unknown) => sendResponse({ error: String(error) }));
     return true;
   }
+  if (message.type === 'START_DEBUG_RECORDING') {
+    updateSnapshot(message.tabId, (snapshot) => {
+      const session = snapshot.debugSession;
+      const now = Date.now();
+      session.recording = true;
+      session.startedAt ??= now;
+      session.stoppedAt = undefined;
+      if (snapshot.pageInfo) {
+        const safeUrl = redactUrl(snapshot.pageInfo.url);
+        if (session.lastUrl !== safeUrl) {
+          appendDebugEvent(session, { id: crypto.randomUUID(), kind: 'navigation', timestamp: now, url: safeUrl });
+          session.lastUrl = safeUrl;
+        }
+      }
+    }).then(() => sendResponse({ ok: true })).catch((error: unknown) => sendResponse({ error: String(error) }));
+    return true;
+  }
+  if (message.type === 'STOP_DEBUG_RECORDING') {
+    updateSnapshot(message.tabId, (snapshot) => {
+      snapshot.debugSession.recording = false;
+      snapshot.debugSession.stoppedAt = Date.now();
+    }).then(() => sendResponse({ ok: true })).catch((error: unknown) => sendResponse({ error: String(error) }));
+    return true;
+  }
+  if (message.type === 'CLEAR_DEBUG_SESSION') {
+    updateSnapshot(message.tabId, (snapshot) => { snapshot.debugSession = emptyDebugSession(); })
+      .then(() => sendResponse({ ok: true })).catch((error: unknown) => sendResponse({ error: String(error) }));
+    return true;
+  }
   if (message.type === 'CAPTURE_SCREENSHOT') {
     chrome.tabs.get(message.tabId).then(async (tab) => {
       if (tab.windowId === undefined) throw new Error('The tab is no longer available.');
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
       sendResponse({ dataUrl });
     }).catch((error: unknown) => sendResponse({ error: error instanceof Error ? error.message : String(error) }));
+    return true;
+  }
+  if (message.type === 'REPLAY_REQUEST') {
+    chrome.tabs.sendMessage(message.tabId, message).then(sendResponse)
+      .catch((error: unknown) => sendResponse({ error: error instanceof Error ? error.message : String(error) }));
     return true;
   }
   if (message.type === 'IMPORT_REQUESTS') {
@@ -332,9 +505,29 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   queues.delete(tabId);
-  void chrome.storage.session.remove(keyFor(tabId));
+  void chrome.storage.session.remove([keyFor(tabId), floatingKeyFor(tabId)]);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === 'loading') void saveSnapshot(tabId, emptySnapshot());
+  if (changeInfo.status === 'loading' || changeInfo.url) {
+    void updateSnapshot(tabId, (snapshot) => {
+      if (changeInfo.status !== 'loading' && changeInfo.url && snapshot.pageInfo) {
+        snapshot.pageInfo = { ...snapshot.pageInfo, url: changeInfo.url, timestamp: Date.now() };
+        const session = snapshot.debugSession;
+        if (session.recording) {
+          const safeUrl = redactUrl(changeInfo.url);
+          if (session.lastUrl !== safeUrl) {
+            appendDebugEvent(session, { id: crypto.randomUUID(), kind: 'navigation', timestamp: Date.now(), url: safeUrl });
+            session.lastUrl = safeUrl;
+          }
+        }
+        return;
+      }
+      if (changeInfo.status !== 'loading') return;
+      snapshot.requests = [];
+      snapshot.console = [];
+      snapshot.pageInfo = undefined;
+      snapshot.paused = false;
+    });
+  }
 });

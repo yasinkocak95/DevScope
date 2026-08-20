@@ -12,11 +12,12 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       input: {
-        popup: resolve(rootDir, 'popup.html'),
         devtools: resolve(rootDir, 'devtools.html'),
         panel: resolve(rootDir, 'panel.html'),
         background: resolve(rootDir, 'src/background/index.ts'),
         relay: resolve(rootDir, 'src/content/relay.ts'),
+        floatingLoader: resolve(rootDir, 'src/content/floatingLoader.ts'),
+        floatingUi: resolve(rootDir, 'src/content/floatingUi.tsx'),
         pageHook: resolve(rootDir, 'src/content/pageHook.ts')
       },
       output: {

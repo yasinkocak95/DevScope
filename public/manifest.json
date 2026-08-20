@@ -5,8 +5,7 @@
   "description": "Inspect API traffic and create useful, privacy-conscious bug reports.",
   "minimum_chrome_version": "111",
   "action": {
-    "default_title": "Open DevScope",
-    "default_popup": "popup.html"
+    "default_title": "Open DevScope"
   },
   "background": {
     "service_worker": "assets/background.js",
@@ -17,6 +16,7 @@
     "activeTab",
     "cookies",
     "declarativeNetRequestWithHostAccess",
+    "scripting",
     "storage",
     "tabs",
     "webRequest"
@@ -31,8 +31,14 @@
     },
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["assets/relay.js"],
+      "js": ["assets/relay.js", "assets/floatingLoader.js"],
       "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["http://*/*", "https://*/*"]
     }
   ]
 }

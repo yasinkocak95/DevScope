@@ -54,11 +54,37 @@ export type Settings = {
   maximumStoredRequests: number;
 };
 
+export type DebugTraceKind = 'click' | 'submit' | 'navigation' | 'request' | 'response' | 'failed-request' | 'console';
+
+export type DebugTraceEvent = {
+  id: string;
+  kind: DebugTraceKind;
+  timestamp: number;
+  label?: string;
+  url?: string;
+  method?: string;
+  status?: number;
+  statusText?: string;
+  error?: string;
+  level?: ConsoleLevel;
+  relatedActionId?: string;
+  requestEventId?: string;
+};
+
+export type DebugSession = {
+  recording: boolean;
+  startedAt?: number;
+  stoppedAt?: number;
+  lastUrl?: string;
+  events: DebugTraceEvent[];
+};
+
 export type TabSnapshot = {
   requests: NetworkRecord[];
   console: ConsoleRecord[];
   pageInfo?: PageInfo;
   paused: boolean;
+  debugSession: DebugSession;
 };
 
 export type PageNetworkEvent = {
@@ -90,7 +116,13 @@ export type PageConsoleEvent = {
 };
 
 export type PageMetaEvent = { kind: 'page-info'; pageInfo: PageInfo };
-export type PageEvent = PageNetworkEvent | PageConsoleEvent | PageMetaEvent;
+export type PageDebugActionEvent = {
+  kind: 'debug-action';
+  action: 'click' | 'submit';
+  timestamp: number;
+  label?: string;
+};
+export type PageEvent = PageNetworkEvent | PageConsoleEvent | PageMetaEvent | PageDebugActionEvent;
 
 export type ReplayRequest = {
   method: string;
@@ -139,6 +171,8 @@ export type CookieRecord = {
 
 export type StorageSnapshot = WebStorageData & { cookies: CookieRecord[] };
 
+export type FloatingPanelPosition = { left: number; top: number };
+
 export type JwtRecord = {
   source: 'localStorage' | 'sessionStorage' | 'cookie';
   name: string;
@@ -151,18 +185,26 @@ export type JwtRecord = {
 
 export type ExtensionMessage =
   | { type: 'PAGE_EVENT'; payload: PageEvent }
+  | { type: 'GET_TAB_INFO'; tabId: number }
   | { type: 'GET_SNAPSHOT'; tabId: number }
   | { type: 'CLEAR_TAB'; tabId: number }
   | { type: 'SET_PAUSED'; tabId: number; paused: boolean }
+  | { type: 'START_DEBUG_RECORDING'; tabId: number }
+  | { type: 'STOP_DEBUG_RECORDING'; tabId: number }
+  | { type: 'CLEAR_DEBUG_SESSION'; tabId: number }
   | { type: 'CAPTURE_SCREENSHOT'; tabId: number }
-  | { type: 'REPLAY_REQUEST'; request: ReplayRequest }
+  | { type: 'REPLAY_REQUEST'; tabId: number; request: ReplayRequest }
   | { type: 'GET_WEB_STORAGE' }
   | { type: 'GET_STORAGE_DATA'; tabId: number }
   | { type: 'IMPORT_REQUESTS'; tabId: number; requests: NetworkRecord[] }
   | { type: 'GET_RULES' }
   | { type: 'SAVE_RULE'; rule: RequestRule }
   | { type: 'DELETE_RULE'; ruleId: number }
-  | { type: 'TOGGLE_RULE'; ruleId: number; enabled: boolean };
+  | { type: 'TOGGLE_RULE'; ruleId: number; enabled: boolean }
+  | { type: 'GET_FLOATING_STATE' }
+  | { type: 'SET_FLOATING_OPEN'; open: boolean }
+  | { type: 'SHOW_FLOATING_PANEL'; tabId: number }
+  | { type: 'HIDE_FLOATING_PANEL' };
 
 export type BugForm = {
   title: string;

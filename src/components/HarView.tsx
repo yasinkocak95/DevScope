@@ -4,6 +4,7 @@ import type { ExtensionMessage, NetworkRecord } from '../types';
 import { downloadText } from '../utils/clipboard';
 import { exportHar, importHar } from '../utils/har';
 import type { Translate } from '../utils/i18n';
+import { sendRuntimeMessage } from '../utils/chromeRuntime';
 
 export function HarView({ requests, tabId, reveal, onImported, t }: { requests: NetworkRecord[]; tabId?: number; reveal: boolean; onImported: () => Promise<void>; t: Translate }) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -19,7 +20,7 @@ export function HarView({ requests, tabId, reveal, onImported, t }: { requests: 
     try {
       if (file.size > 20 * 1024 * 1024) throw new Error('INVALID_HAR');
       const imported = importHar(await file.text());
-      const result = await chrome.runtime.sendMessage({ type: 'IMPORT_REQUESTS', tabId, requests: imported } satisfies ExtensionMessage) as { error?: string; count?: number };
+      const result = await sendRuntimeMessage<{ error?: string; count?: number }>({ type: 'IMPORT_REQUESTS', tabId, requests: imported } satisfies ExtensionMessage);
       if (result?.error) throw new Error(result.error);
       await onImported();
       setNotice(t('harImported').replace('{count}', String(result.count ?? imported.length)));

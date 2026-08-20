@@ -5,6 +5,7 @@ import { compareNetworkRequests, replayAsComparable } from '../utils/diff';
 import { endpointFor, prettyBody } from '../utils/format';
 import type { Language, Translate } from '../utils/i18n';
 import { redactHeaders, redactText, sanitizeRequest } from '../utils/redaction';
+import { sendRuntimeMessage } from '../utils/chromeRuntime';
 import { DiffView } from './DiffView';
 
 const headersText = (headers: Header[]): string => headers.map(({ name, value }) => `${name}: ${value}`).join('\n');
@@ -68,7 +69,7 @@ export function ReplayInspector({ request, tabId, reveal, t, language }: { reque
     const replayRequest: ReplayRequest = { method: editor.method, url: url.toString(), headers, body: editor.body || undefined };
     setSending(true);
     try {
-      const result = await chrome.tabs.sendMessage(tabId, { type: 'REPLAY_REQUEST', request: replayRequest }) as ReplayResponse;
+      const result = await sendRuntimeMessage<ReplayResponse>({ type: 'REPLAY_REQUEST', tabId, request: replayRequest });
       setSentRequest(replayRequest);
       setResponse(result);
       if (result.error) setError(`${t('replayFailed')}: ${result.error === 'REPLAY_TIMEOUT' ? t('replayTimeout') : result.error}`);

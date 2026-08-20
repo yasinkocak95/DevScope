@@ -3,6 +3,7 @@ import type { Header, NetworkRecord } from '../types';
 const SENSITIVE_KEY = /(^|[-_])(authorization|access[-_]?token|refresh[-_]?token|password|passwd|secret|api[-_]?key|cookie|set[-_]?cookie)($|[-_])/i;
 const JWT = /\beyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g;
 const BEARER = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const SENSITIVE_LINE = /((?:cookie|set-cookie|authorization)\s*[:=]\s*)[^\r\n]+/gi;
 const MASK = '[REDACTED]';
 
 export function isSensitiveKey(key: string): boolean {
@@ -10,12 +11,12 @@ export function isSensitiveKey(key: string): boolean {
 }
 
 export function redactText(value: string): string {
-  let result = value.replace(BEARER, `Bearer ${MASK}`).replace(JWT, MASK);
+  let result = value.replace(BEARER, `Bearer ${MASK}`).replace(JWT, MASK).replace(SENSITIVE_LINE, `$1${MASK}`);
   try {
     const parsed: unknown = JSON.parse(value);
     return JSON.stringify(redactJson(parsed), null, 2);
   } catch {
-    return result.replace(/((?:password|passwd|secret|access_token|refresh_token|api_key|api-key)\s*[=:]\s*)[^&\s,;}]+/gi, `$1${MASK}`);
+    return result.replace(/((?:password|passwd|secret|token|access_token|refresh_token|api_key|api-key)\s*[=:]\s*)[^&\s,;}]+/gi, `$1${MASK}`);
   }
 }
 

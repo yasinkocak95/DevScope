@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type PointerEventHandler } from 'react';
 import {
-  Activity, AlertCircle, Bug, CheckCircle2, Clipboard, Code2, Database, Download,
+  Activity, AlertCircle, Bug, CheckCircle2, CircleDot, Clipboard, Code2, Database, Download,
   Gauge, Globe2, Pause, Play, RefreshCw, Search, Settings as SettingsIcon,
   ShieldCheck, Trash2, X
 } from 'lucide-react';
 import { useDevScope } from '../hooks/useDevScope';
+import { sendRuntimeMessage } from '../utils/chromeRuntime';
 import { CompareView } from './CompareView';
+import { DebugRecorderView } from './DebugRecorderView';
 import { HarView } from './HarView';
 import { ReplayInspector } from './ReplayInspector';
 import { RulesView } from './RulesView';
@@ -17,13 +19,21 @@ import { asAxios, asCurl, asFetch, endpointFor, formatBytes, prettyBody } from '
 import { translate, type Language, type Translate } from '../utils/i18n';
 import { jiraReport, markdownReport, plainTextReport, slackReport } from '../utils/report';
 import { redactText, redactUrl, sanitizeRequest } from '../utils/redaction';
-import './app.css';
 
-type Section = 'overview' | 'network' | 'bug' | 'storage' | 'settings';
+type Section = 'overview' | 'network' | 'bug' | 'recorder' | 'storage' | 'settings';
 type NetworkMode = 'requests' | 'compare' | 'rules' | 'har';
 type Filter = 'All' | 'Fetch/XHR' | 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'Errors';
 type DetailTab = 'Overview' | 'Headers' | 'Request' | 'Response' | 'Timing';
 const FILTERS: Filter[] = ['All', 'Fetch/XHR', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'Errors'];
+type ScreenshotResult = { dataUrl?: string; error?: string };
+
+type AppProps = {
+  mode?: 'popup' | 'panel' | 'floating';
+  forcedTabId?: number;
+  onClose?: () => void;
+  onHeaderPointerDown?: PointerEventHandler<HTMLElement>;
+  captureScreenshot?: (tabId: number) => Promise<ScreenshotResult>;
+};
 
 const canInspect = (url: string): boolean => /^https?:/i.test(url);
 const statusClass = (status: number): string => status >= 500 || status === 0 ? 'status-error' : status >= 400 ? 'status-warning' : status >= 300 ? 'status-info' : 'status-success';
@@ -132,10 +142,10 @@ function NetworkView({ requests, tabId, paused, reveal, onPause, onClear, onRefr
   </section>;
 }
 
-function OverviewView({ host, requests, errors, onNavigate, t }: { host: string; requests: NetworkRecord[]; errors: number; onNavigate: (section: Section) => void; t: Translate }) {
+function OverviewView({ url, requests, errors, onNavigate, t }: { url: string; requests: NetworkRecord[]; errors: number; onNavigate: (section: Section) => void; t: Translate }) {
   const failed = requests.filter((request) => request.status >= 400 || request.status === 0);
   return <section className="overview">
-    <div className="page-identity"><Globe2 size={20} /><div><span>{t('currentPage')}</span><strong>{host || t('unavailable')}</strong></div></div>
+    <div className="page-identity"><Globe2 size={20} /><div><span>{t('currentPage')}</span><strong title={url}>{url || t('unavailable')}</strong></div></div>
     <div className="metric-strip">
       <div><span>{t('requests')}</span><strong>{requests.length}</strong></div>
       <div><span>{t('failed')}</span><strong className={failed.length ? 'danger-text' : ''}>{failed.length}</strong></div>
@@ -153,8 +163,8 @@ function OverviewView({ host, requests, errors, onNavigate, t }: { host: string;
 
 const INITIAL_FORM: BugForm = { title: '', description: '', steps: '', expected: '', actual: '', severity: 'Medium' };
 
-function BugReportView({ tabId, pageInfo, requests, consoleItems, reveal, t, language }: {
-  tabId?: number; pageInfo: ReturnType<typeof useDevScope>['snapshot']['pageInfo']; requests: NetworkRecord[]; consoleItems: ReturnType<typeof useDevScope>['snapshot']['console']; reveal: boolean; t: Translate; language: Language;
+function BugReportView({ tabId, pageInfo, requests, consoleItems, reveal, t, language, captureScreenshot }: {
+  tabId?: number; pageInfo: ReturnType<typeof useDevScope>['snapshot']['pageInfo']; requests: NetworkRecord[]; consoleItems: ReturnType<typeof useDevScope>['snapshot']['console']; reveal: boolean; t: Translate; language: Language; captureScreenshot: (tabId: number) => Promise<ScreenshotResult>;
 }) {
   const [form, setForm] = useState<BugForm>(INITIAL_FORM);
   const failed = requests.filter((request) => request.status >= 400 || request.status === 0).slice(0, 20);
@@ -173,9 +183,14 @@ function BugReportView({ tabId, pageInfo, requests, consoleItems, reveal, t, lan
   const capture = async (): Promise<void> => {
     if (tabId === undefined) return;
     setBusy(true); setCaptureError('');
-    const result = await chrome.runtime.sendMessage({ type: 'CAPTURE_SCREENSHOT', tabId }) as { dataUrl?: string; error?: string };
-    if (result.error) setCaptureError(result.error); else setScreenshot(result.dataUrl ?? '');
-    setBusy(false);
+    try {
+      const result = await captureScreenshot(tabId);
+      if (result.error) setCaptureError(result.error); else setScreenshot(result.dataUrl ?? '');
+    } catch (reason) {
+      setCaptureError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
   };
   const doCopy = async (label: string, text: string): Promise<void> => { await copyText(text); setNotice(t('copied').replace('{item}', label)); window.setTimeout(() => setNotice(''), 1600); };
   const toggleAttached = (id: string): void => setAttached((current) => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next; });
@@ -233,24 +248,30 @@ function SettingsView({ settings, onChange, onClear, t }: { settings: Settings; 
   </section>;
 }
 
-export function App({ mode = 'popup', forcedTabId }: { mode?: 'popup' | 'panel'; forcedTabId?: number }) {
+export function App({ mode = 'popup', forcedTabId, onClose, onHeaderPointerDown, captureScreenshot }: AppProps) {
   const [section, setSection] = useState<Section>('overview');
   const [settings, setSettings] = useState<Settings>();
-  const { tabId, tabUrl, snapshot, loading, error, refresh, clear, setPaused } = useDevScope(forcedTabId);
-  useEffect(() => { void getSettings().then(setSettings); }, []);
-  const updateSettings = (value: Settings): void => { setSettings(value); void saveSettings(value); };
+  const { tabId, tabUrl, snapshot, loading, error, refresh, clear, setPaused, startRecording, stopRecording, clearDebugSession } = useDevScope(forcedTabId);
+  useEffect(() => { void getSettings().then(setSettings).catch(() => undefined); }, []);
+  const updateSettings = (value: Settings): void => { setSettings(value); void saveSettings(value).catch(() => undefined); };
   const language = settings?.language ?? 'en';
   const t: Translate = (key) => translate(language, key);
-  useEffect(() => { document.documentElement.lang = language; }, [language]);
+  useEffect(() => {
+    if (mode !== 'floating') document.documentElement.lang = language;
+  }, [language, mode]);
   const reveal = Boolean(settings && !settings.redactSensitiveInformation && settings.revealSensitiveValues);
-  const host = (() => { try { return new URL(snapshot.pageInfo?.url ?? tabUrl).host; } catch { return ''; } })();
-  const supported = canInspect(snapshot.pageInfo?.url ?? tabUrl);
+  const currentUrl = snapshot.pageInfo?.url ?? tabUrl;
+  const supported = canInspect(currentUrl);
 
-  return <div className={`app app-${mode}`}>
-    <header className="app-header"><button className="brand" onClick={() => setSection('overview')} aria-label={`DevScope ${t('overview')}`}><span className="brand-mark"><Code2 size={18} /></span><span><strong>DevScope</strong><small>{t('tagline')}</small></span></button><button className="icon-button" title={t('refreshData')} aria-label={t('refreshData')} onClick={() => void refresh()}><RefreshCw size={17} /></button></header>
+  const takeScreenshot = captureScreenshot ?? (async (targetTabId: number) =>
+    sendRuntimeMessage<ScreenshotResult>({ type: 'CAPTURE_SCREENSHOT', tabId: targetTabId })
+  );
+
+  return <div className={`app app-${mode}`} lang={language}>
+    <header className="app-header" onPointerDown={onHeaderPointerDown}><button className="brand" onClick={() => setSection('overview')} aria-label={`DevScope ${t('overview')}`}><span className="brand-mark"><Code2 size={18} /></span><span><strong>DevScope</strong><small>{t('tagline')}</small></span></button><div className="app-header-actions"><button className="icon-button" title={t('refreshData')} aria-label={t('refreshData')} onClick={() => void refresh()}><RefreshCw size={17} /></button>{mode === 'floating' && <button className="icon-button" title={t('closeDevScope')} aria-label={t('closeDevScope')} onClick={onClose}><X size={18} /></button>}</div></header>
     <nav className="main-nav" aria-label={t('mainNavigation')}>
       {([
-        ['overview', Gauge, t('overview')], ['network', Activity, t('network')], ['bug', Bug, t('bugReport')], ['storage', Database, t('storage')], ['settings', SettingsIcon, t('settings')]
+        ['overview', Gauge, t('overview')], ['network', Activity, t('network')], ['bug', Bug, t('bugReport')], ['recorder', CircleDot, t('recorder')], ['storage', Database, t('storage')], ['settings', SettingsIcon, t('settings')]
       ] as const).map(([id, Icon, label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}><Icon size={16} /><span>{label}</span></button>)}
     </nav>
     <main>
@@ -258,9 +279,10 @@ export function App({ mode = 'popup', forcedTabId }: { mode?: 'popup' | 'panel';
       {!loading && error && <div className="empty-state error-state"><AlertCircle size={28} /><h2>{t('loadError')}</h2><p>{error}</p><button className="button secondary" onClick={() => void refresh()}>{t('tryAgain')}</button></div>}
       {!loading && !error && !supported && section !== 'settings' && <div className="empty-state"><Globe2 size={28} /><h2>{t('cannotInspect')}</h2><p>{t('cannotInspectDetail')}</p></div>}
       {!loading && !error && (supported || section === 'settings') && <>
-        {section === 'overview' && <OverviewView host={host} requests={snapshot.requests} errors={snapshot.console.filter((item) => item.level === 'error').length} onNavigate={setSection} t={t} />}
+        {section === 'overview' && <OverviewView url={currentUrl} requests={snapshot.requests} errors={snapshot.console.filter((item) => item.level === 'error').length} onNavigate={setSection} t={t} />}
         {section === 'network' && <NetworkView requests={snapshot.requests} tabId={tabId} paused={snapshot.paused} reveal={reveal} onPause={(value) => void setPaused(value)} onClear={() => void clear()} onRefresh={refresh} t={t} language={language} />}
-        {section === 'bug' && <BugReportView tabId={tabId} pageInfo={snapshot.pageInfo} requests={snapshot.requests} consoleItems={snapshot.console} reveal={reveal} t={t} language={language} />}
+        {section === 'bug' && <BugReportView tabId={tabId} pageInfo={snapshot.pageInfo} requests={snapshot.requests} consoleItems={snapshot.console} reveal={reveal} t={t} language={language} captureScreenshot={takeScreenshot} />}
+        {section === 'recorder' && <DebugRecorderView session={snapshot.debugSession} pageInfo={snapshot.pageInfo} language={language} t={t} onStart={startRecording} onStop={stopRecording} onClear={clearDebugSession} />}
         {section === 'storage' && <StorageView tabId={tabId} reveal={reveal} t={t} language={language} />}
         {section === 'settings' && settings && <SettingsView settings={settings} onChange={updateSettings} onClear={() => void clear()} t={t} />}
       </>}

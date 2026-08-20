@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Ban, Clock3, Plus, ServerCog, Trash2 } from 'lucide-react';
 import type { ExtensionMessage, RequestRule } from '../types';
+import { sendRuntimeMessage } from '../utils/chromeRuntime';
 import type { Translate } from '../utils/i18n';
 
 export function RulesView({ t }: { t: Translate }) {
@@ -9,8 +10,18 @@ export function RulesView({ t }: { t: Translate }) {
   const [pattern, setPattern] = useState('');
   const [error, setError] = useState('');
 
+  const requestRules = async (message: ExtensionMessage): Promise<(RequestRule[] & { error?: string }) | undefined> => {
+    try {
+      return await sendRuntimeMessage<RequestRule[] & { error?: string }>(message);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return undefined;
+    }
+  };
+
   const load = async (): Promise<void> => {
-    const result = await chrome.runtime.sendMessage({ type: 'GET_RULES' } satisfies ExtensionMessage) as RequestRule[] & { error?: string };
+    const result = await requestRules({ type: 'GET_RULES' } satisfies ExtensionMessage);
+    if (!result) return;
     if (result?.error) setError(result.error); else setRules(Array.isArray(result) ? result : []);
   };
   useEffect(() => { void load(); }, []);
@@ -19,15 +30,18 @@ export function RulesView({ t }: { t: Translate }) {
     if (!name.trim() || !pattern.trim()) { setError(t('ruleSaveError')); return; }
     const id = Math.max(1000, ...rules.map((rule) => rule.id + 1));
     const rule: RequestRule = { id, name: name.trim(), urlPattern: pattern.trim(), action: 'block', enabled: true, createdAt: Date.now() };
-    const result = await chrome.runtime.sendMessage({ type: 'SAVE_RULE', rule } satisfies ExtensionMessage) as RequestRule[] & { error?: string };
+    const result = await requestRules({ type: 'SAVE_RULE', rule } satisfies ExtensionMessage);
+    if (!result) return;
     if (result?.error) setError(`${t('ruleSaveError')}: ${result.error}`); else { setRules(result); setName(''); setPattern(''); setError(''); }
   };
   const toggle = async (rule: RequestRule): Promise<void> => {
-    const result = await chrome.runtime.sendMessage({ type: 'TOGGLE_RULE', ruleId: rule.id, enabled: !rule.enabled } satisfies ExtensionMessage) as RequestRule[] & { error?: string };
+    const result = await requestRules({ type: 'TOGGLE_RULE', ruleId: rule.id, enabled: !rule.enabled } satisfies ExtensionMessage);
+    if (!result) return;
     if (result?.error) setError(result.error === 'RULE_NOT_FOUND' ? t('ruleNotFound') : result.error); else setRules(result);
   };
   const remove = async (ruleId: number): Promise<void> => {
-    const result = await chrome.runtime.sendMessage({ type: 'DELETE_RULE', ruleId } satisfies ExtensionMessage) as RequestRule[] & { error?: string };
+    const result = await requestRules({ type: 'DELETE_RULE', ruleId } satisfies ExtensionMessage);
+    if (!result) return;
     if (result?.error) setError(result.error); else setRules(result);
   };
 
