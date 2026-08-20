@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useState, type PointerEventHandler } from 'react';
 import {
-  Activity, AlertCircle, Bug, CheckCircle2, CircleDot, Clipboard, Code2, Database, Download,
+  Activity, AlertCircle, Bug, CheckCircle2, CircleDot, Clipboard, Database, Download,
   Gauge, Globe2, Pause, Play, RefreshCw, Search, Settings as SettingsIcon,
   ShieldCheck, Trash2, X
 } from 'lucide-react';
@@ -23,6 +23,8 @@ import {
   duplicateRequestMap, matchesSmartNetworkQuery, parseSmartNetworkQuery,
   type DuplicateRequestInfo, type NetworkFilterPreset
 } from '../utils/requestAnalysis';
+
+const BRAND_ICON_URL = chrome.runtime.getURL('icons/devscope-icon-128.png');
 
 type Section = 'overview' | 'network' | 'bug' | 'recorder' | 'storage' | 'settings';
 type NetworkMode = 'requests' | 'compare' | 'rules' | 'har';
@@ -340,7 +342,7 @@ export function App({ mode = 'popup', forcedTabId, onClose, onHeaderPointerDown,
   );
 
   return <div className={`app app-${mode}`} lang={language}>
-    <header className="app-header" onPointerDown={onHeaderPointerDown}><button className="brand" onClick={() => setSection('overview')} aria-label={`DevScope ${t('overview')}`}><span className="brand-mark"><Code2 size={18} /></span><span><strong>DevScope</strong><small>{t('tagline')}</small></span></button><div className="app-header-actions"><button className="icon-button" title={t('refreshData')} aria-label={t('refreshData')} onClick={() => void refresh()}><RefreshCw size={17} /></button>{mode === 'floating' && <button className="icon-button" title={t('closeDevScope')} aria-label={t('closeDevScope')} onClick={onClose}><X size={18} /></button>}</div></header>
+    <header className="app-header" onPointerDown={onHeaderPointerDown}><button className="brand" onClick={() => setSection('overview')} aria-label={`DevScope ${t('overview')}`}><img className="brand-mark" src={BRAND_ICON_URL} alt="" aria-hidden="true" /><span><strong>DevScope</strong><small>{t('tagline')}</small></span></button><div className="app-header-actions"><button className="icon-button" title={t('refreshData')} aria-label={t('refreshData')} onClick={() => void refresh()}><RefreshCw size={17} /></button>{mode === 'floating' && <button className="icon-button" title={t('closeDevScope')} aria-label={t('closeDevScope')} onClick={onClose}><X size={18} /></button>}</div></header>
     <nav className="main-nav" aria-label={t('mainNavigation')}>
       {([
         ['overview', Gauge, t('overview')], ['network', Activity, t('network')], ['bug', Bug, t('bugReport')], ['recorder', CircleDot, t('recorder')], ['storage', Database, t('storage')], ['settings', SettingsIcon, t('settings')]

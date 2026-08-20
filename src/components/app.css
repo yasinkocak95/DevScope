@@ -30,7 +30,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 :host([data-dragging]) .app-floating .app-header { cursor: grabbing; }
 .app-header-actions { display: flex; align-items: center; gap: 8px; }
 .brand { display: flex; min-width: 0; align-items: center; gap: 11px; border: 0; background: transparent; padding: 4px; text-align: left; cursor: pointer; }
-.brand-mark { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border-radius: 7px; background: #0f6cbd; color: white; }
+.brand-mark { display: block; width: 34px; height: 34px; flex: 0 0 auto; object-fit: contain; }
 .brand > span:last-child { display: flex; flex-direction: column; }
 .brand strong { font-size: 16px; line-height: 19px; }
 .brand small { color: var(--muted); font-size: 11px; line-height: 15px; }

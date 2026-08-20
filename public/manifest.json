@@ -4,8 +4,20 @@
   "version": "2.0.0",
   "description": "Inspect API traffic and create useful, privacy-conscious bug reports.",
   "minimum_chrome_version": "111",
+  "icons": {
+    "16": "icons/devscope-icon-16.png",
+    "32": "icons/devscope-icon-32.png",
+    "48": "icons/devscope-icon-48.png",
+    "128": "icons/devscope-icon-128.png"
+  },
   "action": {
-    "default_title": "Open DevScope"
+    "default_title": "Open DevScope",
+    "default_icon": {
+      "16": "icons/devscope-icon-16.png",
+      "32": "icons/devscope-icon-32.png",
+      "48": "icons/devscope-icon-48.png",
+      "128": "icons/devscope-icon-128.png"
+    }
   },
   "background": {
     "service_worker": "assets/background.js",
@@ -37,7 +49,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["assets/*"],
+      "resources": ["assets/*", "icons/*"],
       "matches": ["http://*/*", "https://*/*"]
     }
   ]
