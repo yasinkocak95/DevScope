@@ -13,12 +13,13 @@ import { ReplayInspector } from './ReplayInspector';
 import { RulesView } from './RulesView';
 import { StorageView } from './StorageView';
 import { getSettings, saveSettings } from '../services/settings';
-import type { BugForm, NetworkRecord, Settings } from '../types';
+import type { BugForm, NetworkRecord, RequestInitiatorFrame, Settings } from '../types';
 import { copyText, downloadText } from '../utils/clipboard';
 import { asAxios, asCurl, asFetch, endpointFor, formatBytes, prettyBody } from '../utils/format';
 import { translate, type Language, type Translate } from '../utils/i18n';
 import { jiraReport, markdownReport, plainTextReport, slackReport } from '../utils/report';
 import { redactText, redactUrl, sanitizeRequest } from '../utils/redaction';
+import { duplicateRequestMap, type DuplicateRequestInfo } from '../utils/requestAnalysis';
 
 type Section = 'overview' | 'network' | 'bug' | 'recorder' | 'storage' | 'settings';
 type NetworkMode = 'requests' | 'compare' | 'rules' | 'har';
@@ -46,7 +47,49 @@ function CopyButton({ label, value, onCopied }: { label: string; value: string; 
   return <button className="button secondary compact" onClick={() => void copyText(value).then(() => onCopied(label))}><Clipboard size={14} />{label}</button>;
 }
 
-function RequestDetails({ request, tabId, reveal, onClose, t, language }: { request: NetworkRecord; tabId?: number; reveal: boolean; onClose: () => void; t: Translate; language: Language }) {
+const initiatorSource = (frame: RequestInitiatorFrame): string => {
+  let source = frame.source;
+  try {
+    const url = new URL(frame.source);
+    source = decodeURIComponent(url.pathname).replace(/^\/+/, '') || url.host || frame.source;
+  } catch { /* Keep non-URL stack sources exactly as Chrome reported them. */ }
+  return `${source}${frame.line === undefined ? '' : `:${frame.line}${frame.column === undefined ? '' : `:${frame.column}`}`}`;
+};
+
+const initiatorFunction = (name: string): string => name.endsWith(')') ? name : `${name}()`;
+
+function RequestOrigin({ request, duplicate, t }: { request: NetworkRecord; duplicate?: DuplicateRequestInfo; t: Translate }) {
+  const trigger = request.triggeredBy;
+  const triggerKind = trigger?.action === 'submit' ? t('debugSubmit') : t('debugClick');
+  const triggerLabel = trigger?.label ?? (trigger?.action === 'submit' ? t('unnamedForm') : t('unnamedControl'));
+  const duplicateSummary = duplicate && t('duplicateRequestSummary')
+    .replace('{method}', duplicate.method)
+    .replace('{endpoint}', endpointFor(request.url))
+    .replace('{count}', String(duplicate.count))
+    .replace('{duration}', String(Math.round(duplicate.windowMs)));
+
+  return <div className="request-origin-panel">
+    {duplicate && <div className="duplicate-warning"><AlertCircle size={17} /><div><strong>{t('duplicateRequestDetected')}</strong><span>{duplicateSummary}</span></div></div>}
+    <div className="request-origin-grid">
+      <section>
+        <h3>{t('triggeredBy')}</h3>
+        {trigger ? <p><strong>{triggerKind}</strong><span>→</span><q>{triggerLabel}</q></p> : <em>{t('recorderActionUnavailable')}</em>}
+      </section>
+      <section>
+        <h3>{t('initiator')}</h3>
+        {request.initiator?.frames.length ? <ol className="initiator-stack">
+          {request.initiator.frames.map((frame, index) => <li key={`${frame.source}-${frame.line}-${frame.column}-${index}`}>
+            <code title={frame.source}>{initiatorSource(frame)}</code>
+            {frame.functionName && <span>→ {initiatorFunction(frame.functionName)}</span>}
+          </li>)}
+          <li className="initiator-terminal">→ {request.initiator.type === 'fetch' ? 'fetch()' : 'XMLHttpRequest.send()'}</li>
+        </ol> : <em>{t('initiatorUnavailable')}</em>}
+      </section>
+    </div>
+  </div>;
+}
+
+function RequestDetails({ request, duplicate, tabId, reveal, onClose, t, language }: { request: NetworkRecord; duplicate?: DuplicateRequestInfo; tabId?: number; reveal: boolean; onClose: () => void; t: Translate; language: Language }) {
   const [tab, setTab] = useState<DetailTab>('Overview');
   const [showReplay, setShowReplay] = useState(false);
   const [copied, setCopied] = useState('');
@@ -65,6 +108,7 @@ function RequestDetails({ request, tabId, reveal, onClose, t, language }: { requ
       <div><span className={`method method-${safe.method.toLowerCase()}`}>{safe.method}</span><h2>{endpointFor(safe.url)}</h2></div>
       <div className="detail-heading-actions"><button className="button secondary compact" onClick={() => setShowReplay((value) => !value)}><Play size={14} />{t('editResend')}</button><button className="icon-button" title={t('closeDetails')} aria-label={t('closeDetails')} onClick={onClose}><X size={18} /></button></div>
     </div>
+    <RequestOrigin request={safe} duplicate={duplicate} t={t} />
     <div className="detail-tabs" role="tablist">
       {detailTabs.map(({ id, label }) =>
         <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{label}</button>)}
@@ -109,13 +153,14 @@ function NetworkView({ requests, tabId, paused, reveal, onPause, onClear, onRefr
   const [filter, setFilter] = useState<Filter>('All');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<NetworkRecord>();
+  const duplicates = useMemo(() => duplicateRequestMap(requests), [requests]);
   const filtered = useMemo(() => requests.filter((request) => {
     const matchesFilter = filter === 'All' || filter === 'Fetch/XHR' || filter === request.method || (filter === 'Errors' && (request.status >= 400 || request.status === 0));
     const haystack = `${request.method} ${request.status} ${request.url}`.toLowerCase();
     return matchesFilter && haystack.includes(search.toLowerCase());
   }), [filter, requests, search]);
 
-  if (selected) return <RequestDetails request={selected} tabId={tabId} reveal={reveal} onClose={() => setSelected(undefined)} t={t} language={language} />;
+  if (selected) return <RequestDetails request={selected} duplicate={duplicates.get(selected.id)} tabId={tabId} reveal={reveal} onClose={() => setSelected(undefined)} t={t} language={language} />;
   return <section className="network-view">
     <div className="network-mode-tabs segmented-tabs">
       {([['requests', t('requestsTab')], ['compare', t('compareTab')], ['rules', t('rulesTab')], ['har', t('harTab')]] as const).map(([id, label]) => <button key={id} className={mode === id ? 'active' : ''} onClick={() => setMode(id)}>{label}</button>)}
@@ -128,9 +173,9 @@ function NetworkView({ requests, tabId, paused, reveal, onPause, onClear, onRefr
     <div className="filters" aria-label={t('networkFilters')}>{FILTERS.map((name) => <button key={name} className={filter === name ? 'active' : ''} onClick={() => setFilter(name)}>{name === 'All' ? t('all') : name === 'Errors' ? t('errors') : name}</button>)}</div>
     {paused && <div className="notice"><Pause size={15} /> {t('capturePaused')}</div>}
     <div className="request-list" role="list">
-      {filtered.map((request) => <button className="request-row" key={request.id} onClick={() => setSelected(request)} role="listitem">
+      {filtered.map((request) => <button className={`request-row${duplicates.has(request.id) ? ' duplicate' : ''}`} key={request.id} onClick={() => setSelected(request)} role="listitem">
         <span className={`method method-${request.method.toLowerCase()}`}>{request.method}</span>
-        <span className="endpoint"><strong>{endpointFor(request.url)}</strong><small>{new URL(request.url).host}</small></span>
+        <span className="endpoint"><strong><span>{endpointFor(request.url)}</span>{duplicates.has(request.id) && <mark title={t('duplicateRequestDetected')}>×{duplicates.get(request.id)!.count}</mark>}</strong><small>{new URL(request.url).host}</small></span>
         <Status request={request} />
         <span className="duration">{Math.round(request.duration)} ms</span>
       </button>)}

@@ -35,6 +35,8 @@ DevScope works both as a persistent floating panel and as a Chrome DevTools pane
 - Generate Markdown, plain-text, Jira, GitHub, and Slack-friendly bug reports.
 - Capture visible-area screenshots and attach failed requests or console errors.
 - Record ordered timelines of user actions, navigation, API activity, failures, and console events.
+- Link requests to related Recorder actions and show real fetch/XHR initiator stack frames when Chrome exposes them.
+- Detect bursts of duplicate requests to the same endpoint within one second.
 - Use a draggable floating panel that remains open until explicitly closed.
 - Switch the interface and generated reports between English and Turkish.
 
@@ -196,6 +198,8 @@ DevScope hem kalıcı bir floating panel hem de Chrome DevTools paneli olarak ç
 - Markdown, düz metin, Jira, GitHub ve Slack uyumlu hata raporları oluşturma.
 - Görünür alan ekran görüntüsü alma; başarısız istekleri ve konsol hatalarını rapora ekleme.
 - Kullanıcı aksiyonları, navigasyon, API trafiği, hatalar ve konsol olaylarından sıralı zaman çizelgesi oluşturma.
+- İstekleri ilişkili Recorder aksiyonlarıyla eşleştirme ve Chrome sunduğunda gerçek fetch/XHR initiator stack frame'lerini gösterme.
+- Aynı endpoint'e bir saniye içinde gönderilen tekrarlı istek kümelerini algılama.
 - Açıkça kapatılana kadar sayfada kalan, sürüklenebilir floating panel kullanma.
 - Arayüzü ve raporları Türkçe veya İngilizce kullanma.
 

@@ -1,4 +1,4 @@
-import type { Header, PageEvent, PageInfo, ReplayRequest, ReplayResponse } from '../types';
+import type { Header, PageEvent, PageInfo, ReplayRequest, ReplayResponse, RequestInitiator, RequestInitiatorFrame } from '../types';
 
 const SOURCE = 'devscope-page-hook';
 const MAX_BODY_CHARS = 100_000;
@@ -44,6 +44,29 @@ async function readLimitedText(response: Response): Promise<{ value?: string; tr
 const safeString = (value: unknown): string => {
   if (typeof value === 'string') return value;
   try { return JSON.stringify(value); } catch { return String(value); }
+};
+
+const captureRequestInitiator = (type: RequestInitiator['type']): RequestInitiator | undefined => {
+  const stackLines = new Error().stack?.split('\n').slice(1) ?? [];
+  const frames: RequestInitiatorFrame[] = [];
+
+  for (const rawLine of stackLines) {
+    const line = rawLine.trim();
+    const match = line.match(/^at\s+(?:(.*?)\s+\()?(.+?):(\d+):(\d+)\)?$/);
+    if (!match) continue;
+    const [, rawFunctionName, source, rawLineNumber, rawColumn] = match;
+    if (/\/assets\/pageHook\.js(?:\?|$)/i.test(source) || /^chrome-extension:/i.test(source)) continue;
+    const functionName = rawFunctionName && rawFunctionName !== '<anonymous>' ? rawFunctionName : undefined;
+    frames.push({
+      functionName,
+      source,
+      line: Number(rawLineNumber),
+      column: Number(rawColumn)
+    });
+    if (frames.length >= 8) break;
+  }
+
+  return frames.length ? { type, frames } : undefined;
 };
 
 const headersFrom = (headers?: HeadersInit): Header[] => {
@@ -138,6 +161,7 @@ const nativeFetch = window.fetch;
 window.fetch = async function devScopeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const startedAt = Date.now();
   const traceId = crypto.randomUUID();
+  const initiator = captureRequestInitiator('fetch');
   const request = input instanceof Request ? input : undefined;
   const url = new URL(request?.url ?? String(input), location.href).href;
   const method = (init?.method ?? request?.method ?? 'GET').toUpperCase();
@@ -160,21 +184,21 @@ window.fetch = async function devScopeFetch(input: RequestInfo | URL, init?: Req
       kind: 'network', traceId, method, url, status: response.status, statusText: response.statusText,
       startedAt, duration: Date.now() - startedAt,
       resourceType: 'fetch', requestHeaders, responseHeaders: [...response.headers.entries()].map(([name, value]) => ({ name, value })),
-      requestBody: requestBody.value, responseBody: responseText, contentType, truncated
+      requestBody: requestBody.value, responseBody: responseText, contentType, truncated, initiator
     });
     return response;
   } catch (error) {
     send({
       kind: 'network', traceId, method, url, status: 0, startedAt, duration: Date.now() - startedAt,
       resourceType: 'fetch', requestHeaders, responseHeaders: [], requestBody: requestBody.value,
-      error: error instanceof Error ? error.message : String(error), truncated: requestBody.truncated
+      error: error instanceof Error ? error.message : String(error), truncated: requestBody.truncated, initiator
     });
     throw error;
   }
 };
 
 const NativeXHR = window.XMLHttpRequest;
-type TrackedXhr = XMLHttpRequest & { __ds?: { method: string; url: string; startedAt: number; body?: string; requestHeaders: Header[] } };
+type TrackedXhr = XMLHttpRequest & { __ds?: { method: string; url: string; startedAt: number; body?: string; requestHeaders: Header[]; initiator?: RequestInitiator } };
 const nativeOpen = NativeXHR.prototype.open;
 const nativeSend = NativeXHR.prototype.send;
 const nativeSetHeader = NativeXHR.prototype.setRequestHeader;
@@ -193,6 +217,7 @@ NativeXHR.prototype.send = function (this: TrackedXhr, body?: Document | XMLHttp
   const meta = this.__ds ?? { method: 'GET', url: '', startedAt: 0, requestHeaders: [] };
   meta.startedAt = Date.now();
   meta.body = typeof body === 'string' ? body : undefined;
+  meta.initiator = captureRequestInitiator('xhr');
   const done = (): void => {
     const contentType = this.getResponseHeader('content-type') ?? undefined;
     let responseBody: string | undefined;
@@ -208,7 +233,8 @@ NativeXHR.prototype.send = function (this: TrackedXhr, body?: Document | XMLHttp
       resourceType: 'xhr', requestHeaders: meta.requestHeaders,
       responseHeaders: rawHeaders.map((line) => { const index = line.indexOf(':'); return { name: line.slice(0, index).trim(), value: line.slice(index + 1).trim() }; }),
       requestBody: req.value, responseBody: res.value, contentType, truncated: req.truncated || res.truncated,
-      error: this.status === 0 ? 'Network request failed or was blocked' : undefined
+      error: this.status === 0 ? 'Network request failed or was blocked' : undefined,
+      initiator: meta.initiator
     });
   };
   this.addEventListener('loadend', done, { once: true });

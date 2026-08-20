@@ -57,6 +57,14 @@ export function sanitizeRequest(request: NetworkRecord, reveal: boolean): Networ
     requestHeaders: redactHeaders(request.requestHeaders),
     responseHeaders: redactHeaders(request.responseHeaders),
     requestBody: request.requestBody ? redactText(request.requestBody) : undefined,
-    responseBody: request.responseBody ? redactText(request.responseBody) : undefined
+    responseBody: request.responseBody ? redactText(request.responseBody) : undefined,
+    initiator: request.initiator ? {
+      ...request.initiator,
+      frames: request.initiator.frames.map((frame) => ({ ...frame, source: redactUrl(frame.source) }))
+    } : undefined,
+    triggeredBy: request.triggeredBy ? {
+      ...request.triggeredBy,
+      label: request.triggeredBy.label ? redactText(request.triggeredBy.label) : undefined
+    } : undefined
   };
 }

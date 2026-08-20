@@ -1,5 +1,23 @@
 export type Header = { name: string; value: string };
 
+export type RequestInitiatorFrame = {
+  functionName?: string;
+  source: string;
+  line?: number;
+  column?: number;
+};
+
+export type RequestInitiator = {
+  type: 'fetch' | 'xhr';
+  frames: RequestInitiatorFrame[];
+};
+
+export type RequestTrigger = {
+  action: 'click' | 'submit';
+  label?: string;
+  timestamp: number;
+};
+
 export type NetworkRecord = {
   id: string;
   tabId: number;
@@ -19,6 +37,10 @@ export type NetworkRecord = {
   contentType?: string;
   error?: string;
   truncated?: boolean;
+  initiator?: RequestInitiator;
+  triggeredBy?: RequestTrigger;
+  pageTraceId?: string;
+  webRequestId?: string;
 };
 
 export type ConsoleLevel = 'error' | 'warn';
@@ -104,6 +126,7 @@ export type PageNetworkEvent = {
   contentType?: string;
   error?: string;
   truncated?: boolean;
+  initiator?: RequestInitiator;
 };
 
 export type PageConsoleEvent = {

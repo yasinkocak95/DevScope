@@ -1,6 +1,7 @@
 import { DEFAULT_SETTINGS, getSettings } from '../services/settings';
-import type { CookieRecord, DebugSession, DebugTraceEvent, ExtensionMessage, Header, NetworkRecord, PageNetworkEvent, RequestRule, Settings, StorageSnapshot, TabSnapshot, WebStorageData } from '../types';
+import type { CookieRecord, DebugSession, DebugTraceEvent, ExtensionMessage, Header, NetworkRecord, PageNetworkEvent, RequestRule, RequestTrigger, Settings, StorageSnapshot, TabSnapshot, WebStorageData } from '../types';
 import { redactText, redactUrl } from '../utils/redaction';
+import { closestUnpairedRequest } from '../utils/requestAnalysis';
 
 const emptyDebugSession = (): DebugSession => ({ recording: false, events: [] });
 const emptySnapshot = (): TabSnapshot => ({ requests: [], console: [], paused: false, debugSession: emptyDebugSession() });
@@ -65,6 +66,11 @@ function relatedAction(session: DebugSession, timestamp: number): DebugTraceEven
     && timestamp >= event.timestamp
     && timestamp - event.timestamp <= ACTION_ASSOCIATION_WINDOW_MS
   );
+}
+
+function requestTrigger(event?: DebugTraceEvent): RequestTrigger | undefined {
+  if (!event || (event.kind !== 'click' && event.kind !== 'submit')) return undefined;
+  return { action: event.kind, label: event.label, timestamp: event.timestamp };
 }
 
 async function getRules(): Promise<RequestRule[]> {
@@ -174,6 +180,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       startedAt: details.timeStamp,
       duration: 0,
       resourceType: 'xmlhttprequest',
+      webRequestId: details.requestId,
       requestHeaders: [],
       responseHeaders: [],
       requestBody: settings.captureNetworkRequests ? requestBody(details) : undefined
@@ -231,10 +238,9 @@ async function finishRequest(requestId: string, endTime: number, error?: string)
   item.error = error;
   if (item.requestBody) item.requestSize = new TextEncoder().encode(item.requestBody).byteLength;
   await updateSnapshot(item.tabId, (snapshot) => {
+    item.triggeredBy ??= requestTrigger(relatedAction(snapshot.debugSession, item.startedAt));
     if (settings.captureNetworkRequests && !snapshot.paused) {
-      const pageRecord = snapshot.requests.find((candidate) =>
-        candidate.method === item.method && candidate.url === item.url && Math.abs(candidate.startedAt - item.startedAt) < 5_000
-      );
+      const pageRecord = closestUnpairedRequest(snapshot.requests, item, 'web');
       if (pageRecord) {
         Object.assign(pageRecord, {
           status: item.status || pageRecord.status,
@@ -246,7 +252,9 @@ async function finishRequest(requestId: string, endTime: number, error?: string)
           requestSize: item.requestSize ?? pageRecord.requestSize,
           responseSize: item.responseSize ?? pageRecord.responseSize,
           contentType: pageRecord.contentType ?? item.contentType,
-          error: item.error ?? pageRecord.error
+          error: item.error ?? pageRecord.error,
+          triggeredBy: pageRecord.triggeredBy ?? item.triggeredBy,
+          webRequestId: item.webRequestId
         });
       } else {
         snapshot.requests.unshift(item);
@@ -283,10 +291,8 @@ chrome.webRequest.onErrorOccurred.addListener(
   { urls: ['http://*/*', 'https://*/*'], types: ['xmlhttprequest'] }
 );
 
-function mergePageNetwork(snapshot: TabSnapshot, payload: PageNetworkEvent): void {
-  const match = snapshot.requests.find((item) =>
-    item.method === payload.method && item.url === payload.url && Math.abs(item.startedAt - payload.startedAt) < 5_000
-  );
+function mergePageNetwork(snapshot: TabSnapshot, payload: PageNetworkEvent, triggeredBy?: RequestTrigger): void {
+  const match = closestUnpairedRequest(snapshot.requests, payload, 'page');
   if (match) {
     Object.assign(match, {
       status: payload.status || match.status,
@@ -301,7 +307,10 @@ function mergePageNetwork(snapshot: TabSnapshot, payload: PageNetworkEvent): voi
       responseSize: payload.responseBody ? new TextEncoder().encode(payload.responseBody).byteLength : match.responseSize,
       contentType: payload.contentType ?? match.contentType,
       error: payload.error ?? match.error,
-      truncated: payload.truncated
+      truncated: payload.truncated,
+      initiator: payload.initiator,
+      triggeredBy: match.triggeredBy ?? triggeredBy,
+      pageTraceId: payload.traceId
     });
     return;
   }
@@ -315,6 +324,7 @@ function mergePageNetwork(snapshot: TabSnapshot, payload: PageNetworkEvent): voi
     startedAt: payload.startedAt,
     duration: payload.duration,
     resourceType: payload.resourceType,
+    pageTraceId: payload.traceId,
     requestHeaders: payload.requestHeaders,
     responseHeaders: payload.responseHeaders,
     requestBody: payload.requestBody,
@@ -323,7 +333,9 @@ function mergePageNetwork(snapshot: TabSnapshot, payload: PageNetworkEvent): voi
     responseSize: payload.responseBody ? new TextEncoder().encode(payload.responseBody).byteLength : undefined,
     contentType: payload.contentType,
     error: payload.error,
-    truncated: payload.truncated
+    truncated: payload.truncated,
+    initiator: payload.initiator,
+    triggeredBy
   });
 }
 
@@ -367,7 +379,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
         });
       }
       if (payload.kind === 'network' && settings.captureNetworkRequests && !snapshot.paused) {
-        mergePageNetwork(snapshot, payload);
+        const triggeredBy = requestTrigger(relatedAction(session, payload.startedAt));
+        mergePageNetwork(snapshot, payload, triggeredBy);
         snapshot.requests.forEach((request) => { if (request.tabId < 0) request.tabId = tabId; });
         snapshot.requests = snapshot.requests.slice(0, settings.maximumStoredRequests);
       }
