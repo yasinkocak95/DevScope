@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "DevScope",
+  "version": "2.0.0",
+  "description": "Inspect API traffic and create useful, privacy-conscious bug reports.",
+  "minimum_chrome_version": "111",
+  "action": {
+    "default_title": "Open DevScope",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "assets/background.js",
+    "type": "module"
+  },
+  "devtools_page": "devtools.html",
+  "permissions": [
+    "activeTab",
+    "cookies",
+    "declarativeNetRequestWithHostAccess",
+    "storage",
+    "tabs",
+    "webRequest"
+  ],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["assets/pageHook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["assets/relay.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
