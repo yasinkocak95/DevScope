@@ -185,6 +185,7 @@ export type JwtRecord = {
 
 export type ExtensionMessage =
   | { type: 'PAGE_EVENT'; payload: PageEvent }
+  | { type: 'DATA_UPDATED'; tabId: number }
   | { type: 'GET_TAB_INFO'; tabId: number }
   | { type: 'GET_SNAPSHOT'; tabId: number }
   | { type: 'CLEAR_TAB'; tabId: number }

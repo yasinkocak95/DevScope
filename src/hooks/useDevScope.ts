@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ExtensionMessage, TabSnapshot } from '../types';
 import { extensionContextAvailable, sendRuntimeMessage } from '../utils/chromeRuntime';
 
@@ -10,6 +10,7 @@ export function useDevScope(forcedTabId?: number) {
   const [snapshot, setSnapshot] = useState<TabSnapshot>(EMPTY);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const autoRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
     if (forcedTabId !== undefined) {
@@ -50,13 +51,26 @@ export function useDevScope(forcedTabId?: number) {
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
     const listener = (message: { type?: string; tabId?: number }): void => {
-      if (message.type === 'DATA_UPDATED' && message.tabId === tabId) void refresh();
+      if (message.type !== 'DATA_UPDATED' || message.tabId !== tabId) return;
+
+      // A route can update through both the page hook and tabs.onUpdated, and
+      // route rendering can emit several network/console events together.
+      // Coalesce that burst into one snapshot load without affecting manual refresh.
+      if (autoRefreshTimer.current !== undefined) clearTimeout(autoRefreshTimer.current);
+      autoRefreshTimer.current = setTimeout(() => {
+        autoRefreshTimer.current = undefined;
+        void refresh();
+      }, 25);
     };
     try {
       if (!extensionContextAvailable()) return;
       chrome.runtime.onMessage.addListener(listener);
     } catch { return; }
     return () => {
+      if (autoRefreshTimer.current !== undefined) {
+        clearTimeout(autoRefreshTimer.current);
+        autoRefreshTimer.current = undefined;
+      }
       try {
         if (extensionContextAvailable()) chrome.runtime.onMessage.removeListener(listener);
       } catch { /* The extension was reloaded while this page stayed open. */ }

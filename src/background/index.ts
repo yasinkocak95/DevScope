@@ -34,7 +34,13 @@ async function loadSnapshot(tabId: number): Promise<TabSnapshot> {
 
 async function saveSnapshot(tabId: number, snapshot: TabSnapshot): Promise<void> {
   await chrome.storage.session.set({ [keyFor(tabId)]: snapshot });
-  chrome.runtime.sendMessage({ type: 'DATA_UPDATED', tabId }).catch(() => undefined);
+  const message = { type: 'DATA_UPDATED', tabId } satisfies ExtensionMessage;
+
+  // Extension pages (popup and DevTools) receive runtime messages, while the
+  // floating panel lives in the inspected tab's content-script context.
+  // Notify both surfaces so they execute the same refresh path.
+  chrome.runtime.sendMessage(message).catch(() => undefined);
+  chrome.tabs.sendMessage(tabId, message).catch(() => undefined);
 }
 
 function updateSnapshot(tabId: number, mutate: (snapshot: TabSnapshot) => void): Promise<void> {

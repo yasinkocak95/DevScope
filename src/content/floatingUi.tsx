@@ -7,8 +7,8 @@ import { EXTENSION_CONTEXT_INVALIDATED_EVENT, extensionContextAvailable, sendRun
 
 const HOST_ID = `devscope-floating-${chrome.runtime.id}`;
 const POSITION_KEY = 'devscope:floating:position';
-const PANEL_WIDTH = 460;
-const PANEL_HEIGHT = 600;
+const PANEL_WIDTH = 520;
+const PANEL_HEIGHT = 680;
 const PANEL_MARGIN = 16;
 
 type FloatingStateResponse = { open?: boolean; tabId?: number };
@@ -22,9 +22,11 @@ let renderGeneration = 0;
 let currentPosition: FloatingPanelPosition = { left: 0, top: PANEL_MARGIN };
 
 function panelSize(): { width: number; height: number } {
+  const availableWidth = Math.max(0, window.innerWidth - PANEL_MARGIN * 2);
+  const availableHeight = Math.max(0, window.innerHeight - PANEL_MARGIN * 2);
   return {
-    width: Math.min(PANEL_WIDTH, window.innerWidth),
-    height: Math.min(PANEL_HEIGHT, window.innerHeight)
+    width: Math.min(PANEL_WIDTH, availableWidth),
+    height: Math.min(PANEL_HEIGHT, availableHeight)
   };
 }
 
@@ -46,6 +48,8 @@ function placePanel(position: FloatingPanelPosition): void {
   const { width, height } = panelSize();
   setImportant(host, 'width', `${width}px`);
   setImportant(host, 'height', `${height}px`);
+  setImportant(host, 'max-width', `calc(100vw - ${PANEL_MARGIN * 2}px)`);
+  setImportant(host, 'max-height', `calc(100vh - ${PANEL_MARGIN * 2}px)`);
   setImportant(host, 'left', `${currentPosition.left}px`);
   setImportant(host, 'top', `${currentPosition.top}px`);
 }
