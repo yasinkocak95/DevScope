@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type PointerEventHandler } from 'react';
+import { useDeferredValue, useEffect, useMemo, useState, type PointerEventHandler } from 'react';
 import {
   Activity, AlertCircle, Bug, CheckCircle2, CircleDot, Clipboard, Code2, Database, Download,
   Gauge, Globe2, Pause, Play, RefreshCw, Search, Settings as SettingsIcon,
@@ -19,13 +19,16 @@ import { asAxios, asCurl, asFetch, endpointFor, formatBytes, prettyBody } from '
 import { translate, type Language, type Translate } from '../utils/i18n';
 import { jiraReport, markdownReport, plainTextReport, slackReport } from '../utils/report';
 import { redactText, redactUrl, sanitizeRequest } from '../utils/redaction';
-import { duplicateRequestMap, type DuplicateRequestInfo } from '../utils/requestAnalysis';
+import {
+  duplicateRequestMap, matchesSmartNetworkQuery, parseSmartNetworkQuery,
+  type DuplicateRequestInfo, type NetworkFilterPreset
+} from '../utils/requestAnalysis';
 
 type Section = 'overview' | 'network' | 'bug' | 'recorder' | 'storage' | 'settings';
 type NetworkMode = 'requests' | 'compare' | 'rules' | 'har';
-type Filter = 'All' | 'Fetch/XHR' | 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'Errors';
 type DetailTab = 'Overview' | 'Headers' | 'Request' | 'Response' | 'Timing';
-const FILTERS: Filter[] = ['All', 'Fetch/XHR', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'Errors'];
+const FILTERS: NetworkFilterPreset[] = ['All', 'Errors', 'Slow', 'Auth', 'Duplicates', 'Fetch/XHR', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+const REQUEST_RENDER_STEP = 150;
 type ScreenshotResult = { dataUrl?: string; error?: string };
 
 type AppProps = {
@@ -42,6 +45,20 @@ const statusClass = (status: number): string => status >= 500 || status === 0 ? 
 function Status({ request }: { request: NetworkRecord }) {
   return <span className={`status ${statusClass(request.status)}`}>{request.status || 'ERR'}</span>;
 }
+
+function HighlightText({ value, terms }: { value: string; terms: string[] }) {
+  if (!terms.length) return <>{value}</>;
+  const escaped = terms.filter(Boolean).map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!escaped.length) return <>{value}</>;
+  const pattern = new RegExp(`(${escaped.join('|')})`, 'ig');
+  return <>{value.split(pattern).map((part, index) =>
+    terms.some((term) => part.toLowerCase() === term.toLowerCase()) ? <mark className="search-highlight" key={index}>{part}</mark> : part
+  )}</>;
+}
+
+const hostFor = (url: string): string => {
+  try { return new URL(url).host; } catch { return url; }
+};
 
 function CopyButton({ label, value, onCopied }: { label: string; value: string; onCopied: (label: string) => void }) {
   return <button className="button secondary compact" onClick={() => void copyText(value).then(() => onCopied(label))}><Clipboard size={14} />{label}</button>;
@@ -146,19 +163,26 @@ function RequestDetails({ request, duplicate, tabId, reveal, onClose, t, languag
   </section>;
 }
 
-function NetworkView({ requests, tabId, paused, reveal, onPause, onClear, onRefresh, t, language }: {
-  requests: NetworkRecord[]; tabId?: number; paused: boolean; reveal: boolean; onPause: (paused: boolean) => void; onClear: () => void; onRefresh: () => Promise<void>; t: Translate; language: Language;
+function NetworkView({ requests, tabId, paused, captureStatus, reveal, onPause, onClear, onRefresh, t, language }: {
+  requests: NetworkRecord[]; tabId?: number; paused: boolean; captureStatus: 'live' | 'paused' | 'reconnecting'; reveal: boolean; onPause: (paused: boolean) => void; onClear: () => void; onRefresh: () => Promise<void>; t: Translate; language: Language;
 }) {
   const [mode, setMode] = useState<NetworkMode>('requests');
-  const [filter, setFilter] = useState<Filter>('All');
+  const [filter, setFilter] = useState<NetworkFilterPreset>('All');
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [visibleCount, setVisibleCount] = useState(REQUEST_RENDER_STEP);
   const [selected, setSelected] = useState<NetworkRecord>();
-  const duplicates = useMemo(() => duplicateRequestMap(requests), [requests]);
-  const filtered = useMemo(() => requests.filter((request) => {
-    const matchesFilter = filter === 'All' || filter === 'Fetch/XHR' || filter === request.method || (filter === 'Errors' && (request.status >= 400 || request.status === 0));
-    const haystack = `${request.method} ${request.status} ${request.url}`.toLowerCase();
-    return matchesFilter && haystack.includes(search.toLowerCase());
-  }), [filter, requests, search]);
+  const deferredRequests = useDeferredValue(requests);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 180);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+  useEffect(() => { setVisibleCount(REQUEST_RENDER_STEP); }, [debouncedSearch, filter]);
+  const duplicates = useMemo(() => duplicateRequestMap(deferredRequests), [deferredRequests]);
+  const parsedQuery = useMemo(() => parseSmartNetworkQuery(debouncedSearch), [debouncedSearch]);
+  const filtered = useMemo(() => deferredRequests.filter((request) => matchesSmartNetworkQuery(request, parsedQuery, filter, duplicates)), [deferredRequests, duplicates, filter, parsedQuery]);
+  const visibleRequests = filtered.slice(0, visibleCount);
+  const statusLabel = captureStatus === 'paused' ? t('captureStatusPaused') : captureStatus === 'reconnecting' ? t('captureStatusReconnecting') : t('captureStatusLive');
 
   if (selected) return <RequestDetails request={selected} duplicate={duplicates.get(selected.id)} tabId={tabId} reveal={reveal} onClose={() => setSelected(undefined)} t={t} language={language} />;
   return <section className="network-view">
@@ -166,19 +190,22 @@ function NetworkView({ requests, tabId, paused, reveal, onPause, onClear, onRefr
       {([['requests', t('requestsTab')], ['compare', t('compareTab')], ['rules', t('rulesTab')], ['har', t('harTab')]] as const).map(([id, label]) => <button key={id} className={mode === id ? 'active' : ''} onClick={() => setMode(id)}>{label}</button>)}
     </div>
     {mode === 'requests' && <><div className="toolbar">
-      <label className="search"><Search size={16} /><span className="sr-only">{t('searchRequests')}</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('searchPlaceholder')} /></label>
+      <label className="search"><Search size={16} /><span className="sr-only">{t('searchRequests')}</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('smartSearchPlaceholder')} /></label>
+      <span className={`capture-status capture-status-${captureStatus}`} title={t('captureStatus')}><i />{statusLabel}</span>
       <button className="icon-button" title={paused ? t('resumeCapture') : t('pauseCapture')} aria-label={paused ? t('resumeCapture') : t('pauseCapture')} onClick={() => onPause(!paused)}>{paused ? <Play size={17} /> : <Pause size={17} />}</button>
       <button className="icon-button" title={t('clearRequests')} aria-label={t('clearCaptured')} onClick={onClear}><Trash2 size={17} /></button>
     </div>
-    <div className="filters" aria-label={t('networkFilters')}>{FILTERS.map((name) => <button key={name} className={filter === name ? 'active' : ''} onClick={() => setFilter(name)}>{name === 'All' ? t('all') : name === 'Errors' ? t('errors') : name}</button>)}</div>
+    <div className="filters" aria-label={t('networkFilters')}>{FILTERS.map((name) => <button key={name} className={filter === name ? 'active' : ''} onClick={() => setFilter(name)}>{name === 'All' ? t('all') : name === 'Errors' ? t('errors') : name === 'Slow' ? t('slow') : name === 'Auth' ? t('auth') : name === 'Duplicates' ? t('duplicates') : name === 'Fetch/XHR' ? t('fetchXhr') : name}</button>)}</div>
+    <p className="smart-search-hint">{t('smartSearchHint')}</p>
     {paused && <div className="notice"><Pause size={15} /> {t('capturePaused')}</div>}
     <div className="request-list" role="list">
-      {filtered.map((request) => <button className={`request-row${duplicates.has(request.id) ? ' duplicate' : ''}`} key={request.id} onClick={() => setSelected(request)} role="listitem">
+      {visibleRequests.map((request) => <button className={`request-row${duplicates.has(request.id) ? ' duplicate' : ''}`} key={request.id} onClick={() => setSelected(request)} role="listitem">
         <span className={`method method-${request.method.toLowerCase()}`}>{request.method}</span>
-        <span className="endpoint"><strong><span>{endpointFor(request.url)}</span>{duplicates.has(request.id) && <mark title={t('duplicateRequestDetected')}>×{duplicates.get(request.id)!.count}</mark>}</strong><small>{new URL(request.url).host}</small></span>
+        <span className="endpoint"><strong><span><HighlightText value={endpointFor(request.url)} terms={parsedQuery.highlightTerms} /></span>{duplicates.has(request.id) && <mark title={t('duplicateRequestDetected')}>×{duplicates.get(request.id)!.count}</mark>}</strong><small><HighlightText value={hostFor(request.url)} terms={parsedQuery.highlightTerms} /></small></span>
         <Status request={request} />
         <span className="duration">{Math.round(request.duration)} ms</span>
       </button>)}
+      {visibleCount < filtered.length && <button className="show-more-requests" onClick={() => setVisibleCount((count) => count + REQUEST_RENDER_STEP)}>{t('showMoreRequests').replace('{count}', String(filtered.length - visibleCount))}</button>}
       {!filtered.length && <div className="empty-state"><Activity size={28} /><h2>{requests.length ? t('noMatchingRequests') : t('noRequestsYet')}</h2><p>{requests.length ? t('adjustFilters') : t('startCapturing')}</p></div>}
     </div></>}
     {mode === 'compare' && <CompareView requests={requests} reveal={reveal} t={t} />}
@@ -286,7 +313,7 @@ function SettingsView({ settings, onChange, onClear, t }: { settings: Settings; 
     <div className="settings-group"><h2>{t('capture')}</h2>
       <label className="toggle-row"><span><strong>{t('captureConsole')}</strong><small>{t('captureConsoleDetail')}</small></span><input type="checkbox" checked={settings.captureConsoleErrors} onChange={(event) => set('captureConsoleErrors', event.target.checked)} /></label>
       <label className="toggle-row"><span><strong>{t('captureNetwork')}</strong><small>{t('captureNetworkDetail')}</small></span><input type="checkbox" checked={settings.captureNetworkRequests} onChange={(event) => set('captureNetworkRequests', event.target.checked)} /></label>
-      <label className="number-row"><span><strong>{t('maximumRequests')}</strong><small>{t('maximumRequestsDetail')}</small></span><input type="number" min="25" max="500" step="25" value={settings.maximumStoredRequests} onChange={(event) => set('maximumStoredRequests', Math.max(25, Math.min(500, Number(event.target.value))))} /></label>
+      <label className="number-row"><span><strong>{t('maximumRequests')}</strong><small>{t('maximumRequestsDetail')}</small></span><input type="number" min="25" max="1000" step="25" value={settings.maximumStoredRequests} onChange={(event) => set('maximumStoredRequests', Math.max(25, Math.min(1000, Number(event.target.value))))} /></label>
     </div>
     <div className="privacy-note"><ShieldCheck size={20} /><div><strong>{t('browserPrivacy')}</strong><span>{t('browserPrivacyDetail')}</span></div></div>
     <button className="button danger-button" onClick={onClear}><Trash2 size={16} />{t('clearCaptured')}</button>
@@ -296,7 +323,7 @@ function SettingsView({ settings, onChange, onClear, t }: { settings: Settings; 
 export function App({ mode = 'popup', forcedTabId, onClose, onHeaderPointerDown, captureScreenshot }: AppProps) {
   const [section, setSection] = useState<Section>('overview');
   const [settings, setSettings] = useState<Settings>();
-  const { tabId, tabUrl, snapshot, loading, error, refresh, clear, setPaused, startRecording, stopRecording, clearDebugSession } = useDevScope(forcedTabId);
+  const { tabId, tabUrl, snapshot, loading, error, captureStatus, refresh, clear, setPaused, startRecording, stopRecording, clearDebugSession } = useDevScope(forcedTabId);
   useEffect(() => { void getSettings().then(setSettings).catch(() => undefined); }, []);
   const updateSettings = (value: Settings): void => { setSettings(value); void saveSettings(value).catch(() => undefined); };
   const language = settings?.language ?? 'en';
@@ -325,7 +352,7 @@ export function App({ mode = 'popup', forcedTabId, onClose, onHeaderPointerDown,
       {!loading && !error && !supported && section !== 'settings' && <div className="empty-state"><Globe2 size={28} /><h2>{t('cannotInspect')}</h2><p>{t('cannotInspectDetail')}</p></div>}
       {!loading && !error && (supported || section === 'settings') && <>
         {section === 'overview' && <OverviewView url={currentUrl} requests={snapshot.requests} errors={snapshot.console.filter((item) => item.level === 'error').length} onNavigate={setSection} t={t} />}
-        {section === 'network' && <NetworkView requests={snapshot.requests} tabId={tabId} paused={snapshot.paused} reveal={reveal} onPause={(value) => void setPaused(value)} onClear={() => void clear()} onRefresh={refresh} t={t} language={language} />}
+        {section === 'network' && <NetworkView requests={snapshot.requests} tabId={tabId} paused={snapshot.paused} captureStatus={captureStatus} reveal={reveal} onPause={(value) => void setPaused(value)} onClear={() => void clear()} onRefresh={refresh} t={t} language={language} />}
         {section === 'bug' && <BugReportView tabId={tabId} pageInfo={snapshot.pageInfo} requests={snapshot.requests} consoleItems={snapshot.console} reveal={reveal} t={t} language={language} captureScreenshot={takeScreenshot} />}
         {section === 'recorder' && <DebugRecorderView session={snapshot.debugSession} pageInfo={snapshot.pageInfo} language={language} t={t} onStart={startRecording} onStop={stopRecording} onClear={clearDebugSession} />}
         {section === 'storage' && <StorageView tabId={tabId} reveal={reveal} t={t} language={language} />}

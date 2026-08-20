@@ -5,6 +5,13 @@ const MAX_BODY_CHARS = 100_000;
 const INSTALL_FLAG = '__devscopePageHookInstalled__';
 type DevScopeWindow = Window & { [INSTALL_FLAG]?: boolean; navigation?: EventTarget };
 
+// Manifest content scripts are classic scripts. Keep runtime helpers local so
+// Rollup can never turn this entry into an ES module with a static import.
+const STATIC_ASSET_EXTENSION = /\.(?:avif|bmp|css|eot|gif|ico|jpe?g|js|mjs|map|mp3|mp4|ogg|otf|png|svg|ttf|wav|webm|webp|woff2?)(?:$|[?#])/i;
+const STATIC_CONTENT_TYPE = /^(?:image|audio|video|font)\/|(?:text\/css|javascript|ecmascript|font\/|application\/font|application\/octet-stream)/i;
+const isStaticAssetRequest = (url: string, contentType?: string): boolean =>
+  STATIC_ASSET_EXTENSION.test(url) || Boolean(contentType && STATIC_CONTENT_TYPE.test(contentType));
+
 const devScopeWindow = window as DevScopeWindow;
 if (!devScopeWindow[INSTALL_FLAG]) {
   devScopeWindow[INSTALL_FLAG] = true;
@@ -173,6 +180,7 @@ window.fetch = async function devScopeFetch(input: RequestInfo | URL, init?: Req
     let responseText: string | undefined;
     let truncated = requestBody.truncated;
     const contentType = response.headers.get('content-type') ?? undefined;
+    if (isStaticAssetRequest(url, contentType)) return response;
     if (contentType && /(json|text|xml|javascript|graphql|form)/i.test(contentType)) {
       try {
         const body = await readLimitedText(response);
@@ -188,7 +196,7 @@ window.fetch = async function devScopeFetch(input: RequestInfo | URL, init?: Req
     });
     return response;
   } catch (error) {
-    send({
+    if (!isStaticAssetRequest(url)) send({
       kind: 'network', traceId, method, url, status: 0, startedAt, duration: Date.now() - startedAt,
       resourceType: 'fetch', requestHeaders, responseHeaders: [], requestBody: requestBody.value,
       error: error instanceof Error ? error.message : String(error), truncated: requestBody.truncated, initiator
@@ -220,6 +228,8 @@ NativeXHR.prototype.send = function (this: TrackedXhr, body?: Document | XMLHttp
   meta.initiator = captureRequestInitiator('xhr');
   const done = (): void => {
     const contentType = this.getResponseHeader('content-type') ?? undefined;
+    const absoluteUrl = new URL(meta.url, location.href).href;
+    if (isStaticAssetRequest(absoluteUrl, contentType)) return;
     let responseBody: string | undefined;
     if (!this.responseType || this.responseType === 'text' || this.responseType === 'json') {
       try { responseBody = this.responseType === 'json' ? JSON.stringify(this.response) : this.responseText; } catch { /* unavailable */ }
@@ -228,7 +238,7 @@ NativeXHR.prototype.send = function (this: TrackedXhr, body?: Document | XMLHttp
     const res = clip(responseBody);
     const rawHeaders = this.getAllResponseHeaders().trim().split(/[\r\n]+/).filter(Boolean);
     send({
-      kind: 'network', traceId: crypto.randomUUID(), method: meta.method, url: new URL(meta.url, location.href).href,
+      kind: 'network', traceId: crypto.randomUUID(), method: meta.method, url: absoluteUrl,
       status: this.status, statusText: this.statusText, startedAt: meta.startedAt, duration: Date.now() - meta.startedAt,
       resourceType: 'xhr', requestHeaders: meta.requestHeaders,
       responseHeaders: rawHeaders.map((line) => { const index = line.indexOf(':'); return { name: line.slice(0, index).trim(), value: line.slice(index + 1).trim() }; }),

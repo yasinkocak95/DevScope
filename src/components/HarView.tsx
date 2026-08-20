@@ -1,8 +1,8 @@
 import { useRef, useState } from 'react';
 import { Download, FileUp, ShieldCheck } from 'lucide-react';
 import type { ExtensionMessage, NetworkRecord } from '../types';
-import { downloadText } from '../utils/clipboard';
-import { exportHar, importHar } from '../utils/har';
+import { downloadBlob } from '../utils/clipboard';
+import { exportHarBlob, importHar } from '../utils/har';
 import type { Translate } from '../utils/i18n';
 import { sendRuntimeMessage } from '../utils/chromeRuntime';
 
@@ -10,9 +10,17 @@ export function HarView({ requests, tabId, reveal, onImported, t }: { requests: 
   const inputRef = useRef<HTMLInputElement>(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
-  const doExport = (): void => {
-    downloadText(`devscope-${Date.now()}.har`, exportHar(requests, reveal), 'application/json;charset=utf-8');
-    setNotice(t('harExported'));
+  const [exporting, setExporting] = useState(false);
+  const doExport = async (): Promise<void> => {
+    setExporting(true);
+    setError('');
+    try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      downloadBlob(`devscope-${Date.now()}.har`, await exportHarBlob(requests, reveal));
+      setNotice(t('harExported'));
+    } finally {
+      setExporting(false);
+    }
   };
   const doImport = async (file?: File): Promise<void> => {
     if (!file || tabId === undefined) return;
@@ -34,7 +42,7 @@ export function HarView({ requests, tabId, reveal, onImported, t }: { requests: 
     <h2>{t('harTitle')}</h2>
     <p>{t('harDescription')}</p>
     <div className="har-actions">
-      <button className="button primary" disabled={!requests.length} onClick={doExport}><Download size={16} />{t('exportHar')}</button>
+      <button className="button primary" disabled={!requests.length || exporting} onClick={() => void doExport()}><Download size={16} />{exporting ? t('exportingHar') : t('exportHar')}</button>
       <button className="button secondary" onClick={() => inputRef.current?.click()}><FileUp size={16} />{t('importHar')}</button>
       <input ref={inputRef} className="sr-only" type="file" accept=".har,application/json" aria-label={t('chooseHar')} onChange={(event) => void doImport(event.target.files?.[0])} />
     </div>

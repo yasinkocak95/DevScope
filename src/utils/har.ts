@@ -13,12 +13,11 @@ type HarEntry = {
 
 type HarFile = { log: { version: string; creator: { name: string; version: string }; entries: HarEntry[] } };
 
-export function exportHar(requests: NetworkRecord[], revealSensitive: boolean): string {
-  const entries = [...requests].sort((a, b) => a.startedAt - b.startedAt).map((item): HarEntry => {
-    const request = sanitizeRequest(item, revealSensitive);
-    let queryString: HarHeader[] = [];
-    try { queryString = [...new URL(request.url).searchParams.entries()].map(([name, value]) => ({ name, value })); } catch { /* invalid captured URL */ }
-    return {
+const toHarEntry = (item: NetworkRecord, revealSensitive: boolean): HarEntry => {
+  const request = sanitizeRequest(item, revealSensitive);
+  let queryString: HarHeader[] = [];
+  try { queryString = [...new URL(request.url).searchParams.entries()].map(([name, value]) => ({ name, value })); } catch { /* invalid captured URL */ }
+  return {
       startedDateTime: new Date(request.startedAt).toISOString(),
       time: request.duration,
       request: {
@@ -43,10 +42,25 @@ export function exportHar(requests: NetworkRecord[], revealSensitive: boolean): 
       },
       timings: { send: 0, wait: request.duration, receive: 0 },
       _resourceType: request.resourceType
-    };
-  });
+  };
+};
+
+export function exportHar(requests: NetworkRecord[], revealSensitive: boolean): string {
+  const entries = [...requests].sort((a, b) => a.startedAt - b.startedAt).map((item) => toHarEntry(item, revealSensitive));
   const har: HarFile = { log: { version: '1.2', creator: { name: 'DevScope', version: '2.0.0' }, entries } };
   return JSON.stringify(har, null, 2);
+}
+
+export async function exportHarBlob(requests: NetworkRecord[], revealSensitive: boolean): Promise<Blob> {
+  const ordered = [...requests].sort((a, b) => a.startedAt - b.startedAt);
+  const parts: BlobPart[] = ['{"log":{"version":"1.2","creator":{"name":"DevScope","version":"2.0.0"},"entries":['];
+  for (let index = 0; index < ordered.length; index += 1) {
+    if (index > 0) parts.push(',');
+    parts.push(JSON.stringify(toHarEntry(ordered[index], revealSensitive)));
+    if (index > 0 && index % 25 === 0) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+  }
+  parts.push(']}}');
+  return new Blob(parts, { type: 'application/json;charset=utf-8' });
 }
 
 function decodeContent(content: HarEntry['response']['content']): { body?: string; truncated: boolean } {

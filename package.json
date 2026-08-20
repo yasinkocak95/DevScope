@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node tests/spa-navigation.test.mjs",
     "test": "node tests/spa-navigation.test.mjs",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"

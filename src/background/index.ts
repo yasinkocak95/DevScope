@@ -1,7 +1,7 @@
 import { DEFAULT_SETTINGS, getSettings } from '../services/settings';
 import type { CookieRecord, DebugSession, DebugTraceEvent, ExtensionMessage, Header, NetworkRecord, PageNetworkEvent, RequestRule, RequestTrigger, Settings, StorageSnapshot, TabSnapshot, WebStorageData } from '../types';
 import { redactText, redactUrl } from '../utils/redaction';
-import { closestUnpairedRequest } from '../utils/requestAnalysis';
+import { closestUnpairedRequest, isStaticAssetRequest, trimCapturedRequests } from '../utils/requestAnalysis';
 
 const emptyDebugSession = (): DebugSession => ({ recording: false, events: [] });
 const emptySnapshot = (): TabSnapshot => ({ requests: [], console: [], paused: false, debugSession: emptyDebugSession() });
@@ -44,11 +44,11 @@ async function saveSnapshot(tabId: number, snapshot: TabSnapshot): Promise<void>
   chrome.tabs.sendMessage(tabId, message).catch(() => undefined);
 }
 
-function updateSnapshot(tabId: number, mutate: (snapshot: TabSnapshot) => void): Promise<void> {
+function updateSnapshot(tabId: number, mutate: (snapshot: TabSnapshot) => void | boolean): Promise<void> {
   const previous = queues.get(tabId) ?? Promise.resolve();
   const next = previous.then(async () => {
     const snapshot = await loadSnapshot(tabId);
-    mutate(snapshot);
+    if (mutate(snapshot) === false) return;
     await saveSnapshot(tabId, snapshot);
   }).catch(() => undefined);
   queues.set(tabId, next);
@@ -171,6 +171,7 @@ const requestBody = (details: chrome.webRequest.OnBeforeRequestDetails): string 
 chrome.webRequest.onBeforeRequest.addListener(
   (details): undefined => {
     if (details.tabId < 0 || details.type !== 'xmlhttprequest') return undefined;
+    if (isStaticAssetRequest(details.url)) return undefined;
     pending.set(details.requestId, {
       id: details.requestId,
       tabId: details.tabId,
@@ -187,7 +188,7 @@ chrome.webRequest.onBeforeRequest.addListener(
     });
     void updateSnapshot(details.tabId, (snapshot) => {
       const session = snapshot.debugSession;
-      if (!session.recording) return;
+      if (!session.recording) return false;
       const action = relatedAction(session, details.timeStamp);
       appendDebugEvent(session, {
         id: `network:${details.requestId}:request`,
@@ -238,6 +239,10 @@ async function finishRequest(requestId: string, endTime: number, error?: string)
   item.error = error;
   if (item.requestBody) item.requestSize = new TextEncoder().encode(item.requestBody).byteLength;
   await updateSnapshot(item.tabId, (snapshot) => {
+    if (isStaticAssetRequest(item.url, item.contentType)) {
+      snapshot.debugSession.events = snapshot.debugSession.events.filter((event) => event.id !== `network:${requestId}:request`);
+      return snapshot.debugSession.recording;
+    }
     item.triggeredBy ??= requestTrigger(relatedAction(snapshot.debugSession, item.startedAt));
     if (settings.captureNetworkRequests && !snapshot.paused) {
       const pageRecord = closestUnpairedRequest(snapshot.requests, item, 'web');
@@ -259,7 +264,7 @@ async function finishRequest(requestId: string, endTime: number, error?: string)
       } else {
         snapshot.requests.unshift(item);
       }
-      snapshot.requests = snapshot.requests.slice(0, settings.maximumStoredRequests);
+      snapshot.requests = trimCapturedRequests(snapshot.requests, settings.maximumStoredRequests);
     }
 
     const session = snapshot.debugSession;
@@ -378,11 +383,11 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
           }
         });
       }
-      if (payload.kind === 'network' && settings.captureNetworkRequests && !snapshot.paused) {
+      if (payload.kind === 'network' && settings.captureNetworkRequests && !snapshot.paused && !isStaticAssetRequest(payload.url, payload.contentType)) {
         const triggeredBy = requestTrigger(relatedAction(session, payload.startedAt));
         mergePageNetwork(snapshot, payload, triggeredBy);
         snapshot.requests.forEach((request) => { if (request.tabId < 0) request.tabId = tabId; });
-        snapshot.requests = snapshot.requests.slice(0, settings.maximumStoredRequests);
+        snapshot.requests = trimCapturedRequests(snapshot.requests, settings.maximumStoredRequests);
       }
       if (payload.kind === 'console' && settings.captureConsoleErrors && !snapshot.paused) {
         snapshot.console.unshift({ ...payload, id: crypto.randomUUID(), tabId });
@@ -492,7 +497,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
   if (message.type === 'IMPORT_REQUESTS') {
     updateSnapshot(message.tabId, (snapshot) => {
       const imported = message.requests.map((request) => ({ ...request, tabId: message.tabId }));
-      snapshot.requests = [...imported, ...snapshot.requests].slice(0, settings.maximumStoredRequests);
+      snapshot.requests = trimCapturedRequests([...imported, ...snapshot.requests], settings.maximumStoredRequests);
     }).then(() => sendResponse({ ok: true, count: Math.min(message.requests.length, settings.maximumStoredRequests) })).catch((error: unknown) => sendResponse({ error: String(error) }));
     return true;
   }

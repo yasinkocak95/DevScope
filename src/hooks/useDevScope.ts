@@ -10,6 +10,8 @@ export function useDevScope(forcedTabId?: number) {
   const [snapshot, setSnapshot] = useState<TabSnapshot>(EMPTY);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [reconnecting, setReconnecting] = useState(false);
+  const hasConnected = useRef(false);
   const autoRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
@@ -41,14 +43,22 @@ export function useDevScope(forcedTabId?: number) {
       setSnapshot(result ?? EMPTY);
       setTabUrl(tab?.url ?? '');
       setError('');
+      setReconnecting(false);
+      hasConnected.current = true;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (!hasConnected.current) setError(reason instanceof Error ? reason.message : String(reason));
+      setReconnecting(true);
     } finally {
       setLoading(false);
     }
   }, [tabId]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (!reconnecting || !extensionContextAvailable()) return;
+    const timer = window.setTimeout(() => void refresh(), 1_500);
+    return () => window.clearTimeout(timer);
+  }, [reconnecting, refresh]);
   useEffect(() => {
     const listener = (message: { type?: string; tabId?: number }): void => {
       if (message.type !== 'DATA_UPDATED' || message.tabId !== tabId) return;
@@ -109,6 +119,7 @@ export function useDevScope(forcedTabId?: number) {
 
   return {
     tabId, tabUrl, snapshot, loading, error, refresh, clear, setPaused,
+    captureStatus: loading || reconnecting ? 'reconnecting' as const : (snapshot.paused ? 'paused' as const : 'live' as const),
     startRecording: () => updateRecording('START_DEBUG_RECORDING'),
     stopRecording: () => updateRecording('STOP_DEBUG_RECORDING'),
     clearDebugSession: () => updateRecording('CLEAR_DEBUG_SESSION')

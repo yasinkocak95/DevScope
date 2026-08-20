@@ -8,7 +8,10 @@ const requestAnalysisSource = await readFile(new URL('../src/utils/requestAnalys
 const requestAnalysisJavaScript = typeScript.transpileModule(requestAnalysisSource, {
   compilerOptions: { module: typeScript.ModuleKind.ESNext, target: typeScript.ScriptTarget.ES2022 }
 }).outputText;
-const { closestUnpairedRequest, duplicateRequestMap } = await import(`data:text/javascript;base64,${Buffer.from(requestAnalysisJavaScript).toString('base64')}`);
+const {
+  closestUnpairedRequest, duplicateRequestMap, isStaticAssetRequest,
+  matchesSmartNetworkQuery, parseSmartNetworkQuery, trimCapturedRequests
+} = await import(`data:text/javascript;base64,${Buffer.from(requestAnalysisJavaScript).toString('base64')}`);
 
 class BrowserEventTarget extends EventTarget {}
 class BrowserElement {}
@@ -88,6 +91,36 @@ const navigationMessages = (messages) => messages.filter(
 
 const settleNavigation = () => new Promise((resolve) => setTimeout(resolve, 5));
 
+function createRelayContext(sendBehavior = 'callback-error') {
+  const window = new BrowserEventTarget();
+  let sendCount = 0;
+  const runtime = {
+    id: 'devscope-test',
+    lastError: undefined,
+    onMessage: { addListener() {} },
+    sendMessage(_message, callback) {
+      sendCount += 1;
+      if (sendBehavior === 'promise-rejection') {
+        return Promise.reject(new Error('Extension context invalidated.'));
+      }
+      runtime.lastError = { message: 'Extension context invalidated.' };
+      callback();
+      runtime.lastError = undefined;
+    }
+  };
+  Object.assign(window, {
+    window,
+    location: { origin: 'https://www.sky-e.app' },
+    localStorage: {},
+    sessionStorage: {},
+    setTimeout,
+    clearTimeout,
+    postMessage() {}
+  });
+  const context = vm.createContext({ window, chrome: { runtime }, Event, EventTarget, MessageEvent, crypto, setTimeout, clearTimeout });
+  return { context, getSendCount: () => sendCount, window };
+}
+
 test('SPA route changes publish one page-info update and do not duplicate hooks', async () => {
   const bundle = await readFile(new URL('../dist/assets/pageHook.js', import.meta.url), 'utf8');
   const browser = createBrowserContext();
@@ -160,6 +193,37 @@ test('duplicate request analysis reports a bounded burst per request', () => {
   assert.equal(duplicates.has('other-query'), false);
 });
 
+test('smart network filters support field operators, body search, and presets', () => {
+  const base = {
+    id: 'profile', method: 'POST', url: 'https://api.example.com/profile', status: 500,
+    startedAt: 100, duration: 840, resourceType: 'fetch',
+    requestHeaders: [{ name: 'authorization', value: 'Bearer masked' }],
+    responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+    requestBody: '{"displayName":"Ada"}', responseBody: '{"error":"save failed"}'
+  };
+  const duplicates = new Map([['profile', { method: 'POST', endpoint: '/profile', count: 2, windowMs: 100 }]]);
+
+  for (const query of [
+    'status:500', 'status:>=400', 'method:POST', 'time:>500',
+    'domain:api.example.com', 'url:/profile', 'type:fetch', 'displayName', 'save failed', 'authorization'
+  ]) {
+    assert.equal(matchesSmartNetworkQuery(base, parseSmartNetworkQuery(query), 'All', duplicates), true, query);
+  }
+  assert.equal(matchesSmartNetworkQuery(base, parseSmartNetworkQuery('status:<400'), 'All', duplicates), false);
+  assert.equal(matchesSmartNetworkQuery(base, parseSmartNetworkQuery(''), 'Errors', duplicates), true);
+  assert.equal(matchesSmartNetworkQuery(base, parseSmartNetworkQuery(''), 'Slow', duplicates), true);
+  assert.equal(matchesSmartNetworkQuery(base, parseSmartNetworkQuery(''), 'Auth', duplicates), true);
+  assert.equal(matchesSmartNetworkQuery(base, parseSmartNetworkQuery(''), 'Duplicates', duplicates), true);
+});
+
+test('capture stability helpers skip static assets and trim oldest requests', () => {
+  assert.equal(isStaticAssetRequest('https://cdn.example.com/app.js'), true);
+  assert.equal(isStaticAssetRequest('https://cdn.example.com/resource', 'image/webp'), true);
+  assert.equal(isStaticAssetRequest('https://api.example.com/profile', 'application/json'), false);
+  const newestFirst = Array.from({ length: 6 }, (_, index) => ({ id: String(index) }));
+  assert.deepEqual(trimCapturedRequests(newestFirst, 3).map(({ id }) => id), ['0', '1', '2']);
+});
+
 test('parallel duplicate requests correlate one-to-one across capture sources', () => {
   const webRequests = Array.from({ length: 6 }, (_, index) => ({
     id: `web-${index}`,
@@ -182,10 +246,61 @@ test('parallel duplicate requests correlate one-to-one across capture sources', 
   assert.ok(webRequests.every((request) => request.pageTraceId));
 });
 
+test('relay consumes invalidated-context errors and stops forwarding stale page events', async () => {
+  const bundle = await readFile(new URL('../dist/assets/relay.js', import.meta.url), 'utf8');
+  const relay = createRelayContext();
+  vm.runInContext(bundle, relay.context, { filename: 'chrome-extension://devscope/assets/relay.js' });
+  const pageEvent = () => {
+    const event = new Event('message');
+    Object.defineProperties(event, {
+      source: { value: relay.window },
+      data: { value: { source: 'devscope-page-hook', payload: { kind: 'page-info' } } }
+    });
+    return event;
+  };
+
+  relay.window.dispatchEvent(pageEvent());
+  relay.window.dispatchEvent(pageEvent());
+  await Promise.resolve();
+
+  assert.equal(relay.getSendCount(), 1);
+});
+
+test('relay consumes invalidated-context Promise rejections without an uncaught error', async () => {
+  const bundle = await readFile(new URL('../dist/assets/relay.js', import.meta.url), 'utf8');
+  const relay = createRelayContext('promise-rejection');
+  vm.runInContext(bundle, relay.context, { filename: 'chrome-extension://devscope/assets/relay.js' });
+  const pageEvent = () => {
+    const event = new Event('message');
+    Object.defineProperties(event, {
+      source: { value: relay.window },
+      data: { value: { source: 'devscope-page-hook', payload: { kind: 'page-info' } } }
+    });
+    return event;
+  };
+
+  relay.window.dispatchEvent(pageEvent());
+  await Promise.resolve();
+  relay.window.dispatchEvent(pageEvent());
+
+  assert.equal(relay.getSendCount(), 1);
+});
+
 test('built background notifies extension pages and the inspected tab', async () => {
   const bundle = await readFile(new URL('../dist/assets/background.js', import.meta.url), 'utf8');
   assert.match(bundle, /runtime\.sendMessage\(/);
   assert.match(bundle, /tabs\.sendMessage\(/);
+});
+
+test('manifest content scripts are classic-safe standalone bundles', async () => {
+  const manifest = JSON.parse(await readFile(new URL('../dist/manifest.json', import.meta.url), 'utf8'));
+  const scripts = [...new Set(manifest.content_scripts.flatMap(({ js = [] }) => js))];
+  for (const script of scripts) {
+    const bundle = await readFile(new URL(`../dist/${script}`, import.meta.url), 'utf8');
+    assert.doesNotMatch(bundle, /\bimport(?:\s|[{'"*])/m, `${script} contains a static import`);
+    assert.doesNotMatch(bundle, /\bexport(?:\s|[{*])/m, `${script} contains an export`);
+    assert.doesNotThrow(() => new vm.Script(bundle), `${script} must parse as a classic script`);
+  }
 });
 
 test('floating panel keeps readable and viewport-safe layout constraints', async () => {

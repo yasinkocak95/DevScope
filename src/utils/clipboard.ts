@@ -14,7 +14,11 @@ export async function copyText(text: string): Promise<void> {
 }
 
 export function downloadText(filename: string, content: string, mimeType = 'text/markdown;charset=utf-8'): void {
-  const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
+  downloadBlob(filename, new Blob([content], { type: mimeType }));
+}
+
+export function downloadBlob(filename: string, content: Blob): void {
+  const url = URL.createObjectURL(content);
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
