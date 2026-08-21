@@ -12,6 +12,13 @@ const {
   closestUnpairedRequest, duplicateRequestMap, isStaticAssetRequest,
   matchesSmartNetworkQuery, parseSmartNetworkQuery, trimCapturedRequests
 } = await import(`data:text/javascript;base64,${Buffer.from(requestAnalysisJavaScript).toString('base64')}`);
+const navigationStateSource = await readFile(new URL('../src/services/navigationState.ts', import.meta.url), 'utf8');
+const navigationStateJavaScript = typeScript.transpileModule(navigationStateSource, {
+  compilerOptions: { module: typeScript.ModuleKind.ESNext, target: typeScript.ScriptTarget.ES2022 }
+}).outputText;
+const {
+  activeSectionKey, getActiveSection, removeActiveSections, saveActiveSection
+} = await import(`data:text/javascript;base64,${Buffer.from(navigationStateJavaScript).toString('base64')}`);
 
 class BrowserEventTarget extends EventTarget {}
 class BrowserElement {}
@@ -160,6 +167,38 @@ test('SPA route changes publish one page-info update and do not duplicate hooks'
   browser.history.pushState({}, '', '/after-duplicate-install');
   await settleNavigation();
   assert.equal(navigationMessages(browser.messages).length, beforeDuplicateInstall + 1);
+});
+
+test('active section survives SPA refresh and full-route UI remounts per tab and surface', async () => {
+  const values = {};
+  globalThis.chrome = {
+    storage: {
+      local: {
+        async get(key) { return { [key]: values[key] }; },
+        async set(next) { Object.assign(values, next); },
+        async remove(keys) { for (const key of keys) delete values[key]; }
+      }
+    }
+  };
+
+  try {
+    await saveActiveSection('floating', 42, 'storage');
+    assert.equal(await getActiveSection('floating', 42), 'storage', 'route refresh must restore Storage');
+    assert.equal(await getActiveSection('panel', 42), 'overview', 'surfaces keep independent navigation state');
+    assert.equal(await getActiveSection('floating', 7), 'overview', 'tabs keep independent navigation state');
+
+    values[activeSectionKey('panel', 42)] = 'not-a-section';
+    assert.equal(await getActiveSection('panel', 42), 'overview', 'invalid stored state must safely fall back');
+
+    await saveActiveSection('panel', 42, 'network');
+    await saveActiveSection('popup', 42, 'recorder');
+    await removeActiveSections(42);
+    assert.equal(await getActiveSection('floating', 42), 'overview', 'closing a tab cleans floating state');
+    assert.equal(await getActiveSection('panel', 42), 'overview', 'closing a tab cleans panel state');
+    assert.equal(await getActiveSection('popup', 42), 'overview', 'closing a tab cleans popup state');
+  } finally {
+    delete globalThis.chrome;
+  }
 });
 
 test('fetch captures real initiator frames when a stack is available', async () => {

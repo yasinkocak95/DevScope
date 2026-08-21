@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useState, type PointerEventHandler } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type PointerEventHandler } from 'react';
 import {
   Activity, AlertCircle, Bug, CheckCircle2, CircleDot, Clipboard, Database, Download,
   Gauge, Globe2, Pause, Play, RefreshCw, Search, Settings as SettingsIcon,
@@ -13,6 +13,10 @@ import { ReplayInspector } from './ReplayInspector';
 import { RulesView } from './RulesView';
 import { StorageView } from './StorageView';
 import { getSettings, saveSettings } from '../services/settings';
+import {
+  DEFAULT_SECTION, getActiveSection, saveActiveSection,
+  type DevScopeMode, type DevScopeSection
+} from '../services/navigationState';
 import type { BugForm, NetworkRecord, RequestInitiatorFrame, Settings } from '../types';
 import { copyText, downloadText } from '../utils/clipboard';
 import { asAxios, asCurl, asFetch, endpointFor, formatBytes, prettyBody } from '../utils/format';
@@ -26,7 +30,7 @@ import {
 
 const BRAND_ICON_URL = chrome.runtime.getURL('icons/devscope-icon-128.png');
 
-type Section = 'overview' | 'network' | 'bug' | 'recorder' | 'storage' | 'settings';
+type Section = DevScopeSection;
 type NetworkMode = 'requests' | 'compare' | 'rules' | 'har';
 type DetailTab = 'Overview' | 'Headers' | 'Request' | 'Response' | 'Timing';
 const FILTERS: NetworkFilterPreset[] = ['All', 'Errors', 'Slow', 'Auth', 'Duplicates', 'Fetch/XHR', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
@@ -34,7 +38,7 @@ const REQUEST_RENDER_STEP = 150;
 type ScreenshotResult = { dataUrl?: string; error?: string };
 
 type AppProps = {
-  mode?: 'popup' | 'panel' | 'floating';
+  mode?: DevScopeMode;
   forcedTabId?: number;
   onClose?: () => void;
   onHeaderPointerDown?: PointerEventHandler<HTMLElement>;
@@ -323,9 +327,42 @@ function SettingsView({ settings, onChange, onClear, t }: { settings: Settings; 
 }
 
 export function App({ mode = 'popup', forcedTabId, onClose, onHeaderPointerDown, captureScreenshot }: AppProps) {
-  const [section, setSection] = useState<Section>('overview');
+  const [section, setSection] = useState<Section>();
+  const sectionRef = useRef<Section | undefined>(undefined);
+  const sectionRevision = useRef(0);
   const [settings, setSettings] = useState<Settings>();
   const { tabId, tabUrl, snapshot, loading, error, captureStatus, refresh, clear, setPaused, startRecording, stopRecording, clearDebugSession } = useDevScope(forcedTabId);
+  useEffect(() => {
+    if (tabId === undefined) return;
+    let cancelled = false;
+
+    // A popup can be clicked before its active-tab query finishes. Preserve that
+    // explicit selection instead of replacing it with an older stored value.
+    if (sectionRef.current !== undefined) {
+      void saveActiveSection(mode, tabId, sectionRef.current).catch(() => undefined);
+      return;
+    }
+
+    const revision = sectionRevision.current;
+    void getActiveSection(mode, tabId)
+      .then((savedSection) => {
+        if (cancelled || sectionRevision.current !== revision) return;
+        sectionRef.current = savedSection;
+        setSection(savedSection);
+      })
+      .catch(() => {
+        if (cancelled || sectionRevision.current !== revision) return;
+        sectionRef.current = DEFAULT_SECTION;
+        setSection(DEFAULT_SECTION);
+      });
+    return () => { cancelled = true; };
+  }, [mode, tabId]);
+  const navigate = useCallback((nextSection: Section): void => {
+    sectionRevision.current += 1;
+    sectionRef.current = nextSection;
+    setSection(nextSection);
+    if (tabId !== undefined) void saveActiveSection(mode, tabId, nextSection).catch(() => undefined);
+  }, [mode, tabId]);
   useEffect(() => { void getSettings().then(setSettings).catch(() => undefined); }, []);
   const updateSettings = (value: Settings): void => { setSettings(value); void saveSettings(value).catch(() => undefined); };
   const language = settings?.language ?? 'en';
@@ -342,18 +379,18 @@ export function App({ mode = 'popup', forcedTabId, onClose, onHeaderPointerDown,
   );
 
   return <div className={`app app-${mode}`} lang={language}>
-    <header className="app-header" onPointerDown={onHeaderPointerDown}><button className="brand" onClick={() => setSection('overview')} aria-label={`DevScope ${t('overview')}`}><img className="brand-mark" src={BRAND_ICON_URL} alt="" aria-hidden="true" /><span><strong>DevScope</strong><small>{t('tagline')}</small></span></button><div className="app-header-actions"><button className="icon-button" title={t('refreshData')} aria-label={t('refreshData')} onClick={() => void refresh()}><RefreshCw size={17} /></button>{mode === 'floating' && <button className="icon-button" title={t('closeDevScope')} aria-label={t('closeDevScope')} onClick={onClose}><X size={18} /></button>}</div></header>
+    <header className="app-header" onPointerDown={onHeaderPointerDown}><button className="brand" onClick={() => navigate('overview')} aria-label={`DevScope ${t('overview')}`}><img className="brand-mark" src={BRAND_ICON_URL} alt="" aria-hidden="true" /><span><strong>DevScope</strong><small>{t('tagline')}</small></span></button><div className="app-header-actions"><button className="icon-button" title={t('refreshData')} aria-label={t('refreshData')} onClick={() => void refresh()}><RefreshCw size={17} /></button>{mode === 'floating' && <button className="icon-button" title={t('closeDevScope')} aria-label={t('closeDevScope')} onClick={onClose}><X size={18} /></button>}</div></header>
     <nav className="main-nav" aria-label={t('mainNavigation')}>
       {([
         ['overview', Gauge, t('overview')], ['network', Activity, t('network')], ['bug', Bug, t('bugReport')], ['recorder', CircleDot, t('recorder')], ['storage', Database, t('storage')], ['settings', SettingsIcon, t('settings')]
-      ] as const).map(([id, Icon, label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}><Icon size={16} /><span>{label}</span></button>)}
+      ] as const).map(([id, Icon, label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => navigate(id)}><Icon size={16} /><span>{label}</span></button>)}
     </nav>
     <main>
-      {loading && <div className="loading"><span /><p>{t('loading')}</p></div>}
-      {!loading && error && <div className="empty-state error-state"><AlertCircle size={28} /><h2>{t('loadError')}</h2><p>{error}</p><button className="button secondary" onClick={() => void refresh()}>{t('tryAgain')}</button></div>}
-      {!loading && !error && !supported && section !== 'settings' && <div className="empty-state"><Globe2 size={28} /><h2>{t('cannotInspect')}</h2><p>{t('cannotInspectDetail')}</p></div>}
-      {!loading && !error && (supported || section === 'settings') && <>
-        {section === 'overview' && <OverviewView url={currentUrl} requests={snapshot.requests} errors={snapshot.console.filter((item) => item.level === 'error').length} onNavigate={setSection} t={t} />}
+      {(loading || section === undefined) && <div className="loading"><span /><p>{t('loading')}</p></div>}
+      {!loading && section !== undefined && error && <div className="empty-state error-state"><AlertCircle size={28} /><h2>{t('loadError')}</h2><p>{error}</p><button className="button secondary" onClick={() => void refresh()}>{t('tryAgain')}</button></div>}
+      {!loading && section !== undefined && !error && !supported && section !== 'settings' && <div className="empty-state"><Globe2 size={28} /><h2>{t('cannotInspect')}</h2><p>{t('cannotInspectDetail')}</p></div>}
+      {!loading && section !== undefined && !error && (supported || section === 'settings') && <>
+        {section === 'overview' && <OverviewView url={currentUrl} requests={snapshot.requests} errors={snapshot.console.filter((item) => item.level === 'error').length} onNavigate={navigate} t={t} />}
         {section === 'network' && <NetworkView requests={snapshot.requests} tabId={tabId} paused={snapshot.paused} captureStatus={captureStatus} reveal={reveal} onPause={(value) => void setPaused(value)} onClear={() => void clear()} onRefresh={refresh} t={t} language={language} />}
         {section === 'bug' && <BugReportView tabId={tabId} pageInfo={snapshot.pageInfo} requests={snapshot.requests} consoleItems={snapshot.console} reveal={reveal} t={t} language={language} captureScreenshot={takeScreenshot} />}
         {section === 'recorder' && <DebugRecorderView session={snapshot.debugSession} pageInfo={snapshot.pageInfo} language={language} t={t} onStart={startRecording} onStop={stopRecording} onClear={clearDebugSession} />}

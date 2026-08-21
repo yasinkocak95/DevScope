@@ -1,4 +1,5 @@
 import { DEFAULT_SETTINGS, getSettings } from '../services/settings';
+import { removeActiveSections } from '../services/navigationState';
 import type { CookieRecord, DebugSession, DebugTraceEvent, ExtensionMessage, Header, NetworkRecord, PageNetworkEvent, RequestRule, RequestTrigger, Settings, StorageSnapshot, TabSnapshot, WebStorageData } from '../types';
 import { redactText, redactUrl } from '../utils/redaction';
 import { closestUnpairedRequest, isStaticAssetRequest, trimCapturedRequests } from '../utils/requestAnalysis';
@@ -529,7 +530,10 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   queues.delete(tabId);
-  void chrome.storage.session.remove([keyFor(tabId), floatingKeyFor(tabId)]);
+  void Promise.all([
+    chrome.storage.session.remove([keyFor(tabId), floatingKeyFor(tabId)]),
+    removeActiveSections(tabId)
+  ]);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
